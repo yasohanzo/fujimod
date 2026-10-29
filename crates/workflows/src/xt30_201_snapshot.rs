@@ -1,8 +1,11 @@
 //! Decoder for the staged X-T30 2.01 seven-word controller snapshot.
 //!
-//! This module only interprets bytes already returned by a caller. It does
-//! not query a camera, install the callback, or establish controller-read
-//! safety or DRAM capacity.
+//! Decode returned bytes or retrieve one already-published, caller-qualified
+//! RAM snapshot through one E1 read. Neither operation installs the callback
+//! or establishes controller-read safety or DRAM capacity.
+
+mod transfer;
+pub use transfer::{PublishedSnapshot, SnapshotTransferError};
 
 pub const STATUS_ADDRESSES: [u32; 7] = [
     0xff50_7c18,

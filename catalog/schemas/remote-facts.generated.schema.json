@@ -2369,6 +2369,36 @@
       },
       "type": "object"
     },
+    "InputStateCondition": {
+      "additionalProperties": false,
+      "description": "A bounded integer observation and its permitted values.",
+      "properties": {
+        "address": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "values": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "width": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "address",
+        "width",
+        "values"
+      ],
+      "type": "object"
+    },
     "InputTarget": {
       "description": "Ownership of a generated input record without a control alias map.",
       "oneOf": [
@@ -3371,6 +3401,27 @@
         "surface_name",
         "keys",
         "values"
+      ],
+      "type": "object"
+    },
+    "ParameterIndependentInput": {
+      "additionalProperties": false,
+      "description": "A control with a state-qualified input path independent of REC parameter work.",
+      "properties": {
+        "conditions": {
+          "description": "Every condition must match before the parameter checks are inapplicable.",
+          "items": {
+            "$ref": "#/$defs/InputStateCondition"
+          },
+          "type": "array"
+        },
+        "control": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "control",
+        "conditions"
       ],
       "type": "object"
     },
@@ -4407,6 +4458,14 @@
         }
       ],
       "description": "Installed build declarations, absent for stock firmware."
+    },
+    "parameter_independent_inputs": {
+      "default": [],
+      "description": "Controls accepted in declared states while REC parameter work remains active.",
+      "items": {
+        "$ref": "#/$defs/ParameterIndependentInput"
+      },
+      "type": "array"
     },
     "physical_controls": {
       "$ref": "#/$defs/PhysicalControls",

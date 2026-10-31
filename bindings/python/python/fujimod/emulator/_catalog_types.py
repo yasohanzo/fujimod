@@ -290,7 +290,7 @@ Body = TypedDict(
         "connections": Required["list[BodyConnection]"],
         "control_bus_chips": Required["list[ControlBusChip]"],
         "display": NotRequired["DisplayAssembly | None"],
-        "dram_bytes": Required["int"],
+        "dram_bytes": NotRequired["int | None"],
         "hardware": NotRequired["BodyHardware | None"],
         "id": Required["str"],
         "lens": NotRequired["LensAssembly | None"],
@@ -3802,6 +3802,7 @@ RunConfiguration = TypedDict(
         ],
         "body_id": Required["str"],
         "browser_camera": NotRequired["RunBrowserCamera | None"],
+        "dram_address_space": NotRequired["RunDramAddressSpace | None"],
         "execution": NotRequired["RunExecution | None"],
         "firmware_id": Required["str"],
         "id": Required["str"],
@@ -3831,6 +3832,11 @@ type RunCopyProfile = Literal["vg-32bpp-untile-unrotated"]
 
 
 type RunCounterInputProfile = Literal["declared-lens-step-feedback-unmeasured"]
+
+
+class RunDramAddressSpace(TypedDict, total=False):
+    basis: Required[str]
+    limit_bytes: Required[int]
 
 
 class RunEncoderInput(TypedDict, total=False):

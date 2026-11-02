@@ -30,69 +30,76 @@ impl Gpu {
         inputs: &[scanline::CoverageInput],
         output_lengths: &[usize],
     ) -> Result<Vec<Vec<u32>>, String> {
-        let mut active_indices = Vec::new();
-        let mut edge_sets = Vec::new();
+        let mut bands = Vec::new();
         for (index, input) in inputs.iter().enumerate() {
             if input.samples == 0 || output_lengths[index] == 0 {
                 continue;
             }
-            active_indices.push(index);
-            edge_sets.push(
-                input
+            let [x0, x1, y0, y1] = input.bounds;
+            let band_height = if input.edges.len() > 256 { 8 } else { y1 - y0 };
+            for start in (y0..y1).step_by(band_height) {
+                let end = start.saturating_add(band_height).min(y1);
+                let radius = i64::from(input.stroke_radius.unwrap_or(0).max(0));
+                let low = start as i64 * 8 - radius;
+                let high = end as i64 * 8 + radius;
+                let edges: Vec<_> = input
                     .edges
                     .iter()
+                    .filter(|edge| {
+                        i64::from(edge[1].min(edge[3])) <= high
+                            && i64::from(edge[1].max(edge[3])) >= low
+                            && (input.stroke_radius.is_some() || edge[1] != edge[3])
+                    })
                     .map(|edge| {
                         CoverageEdge::new(
                             [edge[0] as f32 / 8.0, edge[1] as f32 / 8.0],
                             [edge[2] as f32 / 8.0, edge[3] as f32 / 8.0],
                         )
                     })
-                    .collect::<Vec<_>>(),
-            );
+                    .collect();
+                bands.push((index, [x0, x1, start, end], edges));
+            }
         }
-        if active_indices.is_empty() {
-            return Ok(output_lengths
-                .iter()
-                .map(|length| vec![0; *length])
-                .collect());
-        }
-
-        let requests: Vec<_> = active_indices
-            .iter()
-            .zip(&edge_sets)
-            .map(|(&index, edges)| {
-                let input = &inputs[index];
-                let sample_grid = match input.samples {
-                    1 => SampleGrid::OneByOne,
-                    2 => SampleGrid::TwoByTwo,
-                    4 => SampleGrid::FourByFour,
-                    _ => unreachable!("SMAPH coverage inputs are validated before dispatch"),
-                };
-                let [x0, x1, y0, y1] = input.bounds;
-                CoverageRequest {
-                    bounds: [x0 as u32, x1 as u32, y0 as u32, y1 as u32],
-                    edges,
-                    edge_coordinates: EdgeCoordinates::EighthPixel,
-                    fill_rule: if input.nonzero {
-                        FillRule::NonZero
-                    } else {
-                        FillRule::EvenOdd
-                    },
-                    sample_grid,
-                    stroke_radius: input.stroke_radius.map(|radius| radius as f32 / 8.0),
-                }
-            })
-            .collect();
-        let rasterized = self
-            .kernel
-            .coverage_batch(context, &requests)
-            .map_err(|error| format!("SMAPH coverage {error}"))?;
         let mut outputs: Vec<_> = output_lengths
             .iter()
             .map(|length| vec![0; *length])
             .collect();
-        for (index, coverage) in active_indices.into_iter().zip(rasterized) {
-            outputs[index] = coverage;
+        // Bound each dispatch's job count and temporary coverage allocation.
+        for batch in bands.chunks(256) {
+            let requests: Vec<_> = batch
+                .iter()
+                .map(|(index, bounds, edges)| {
+                    let input = &inputs[*index];
+                    CoverageRequest {
+                        bounds: bounds.map(|value| value as u32),
+                        edges,
+                        edge_coordinates: EdgeCoordinates::EighthPixel,
+                        fill_rule: if input.nonzero {
+                            FillRule::NonZero
+                        } else {
+                            FillRule::EvenOdd
+                        },
+                        sample_grid: match input.samples {
+                            1 => SampleGrid::OneByOne,
+                            2 => SampleGrid::TwoByTwo,
+                            4 => SampleGrid::FourByFour,
+                            _ => {
+                                unreachable!("SMAPH coverage inputs are validated before dispatch")
+                            }
+                        },
+                        stroke_radius: input.stroke_radius.map(|radius| radius as f32 / 8.0),
+                    }
+                })
+                .collect();
+            let rasterized = self
+                .kernel
+                .coverage_batch(context, &requests)
+                .map_err(|error| format!("SMAPH coverage {error}"))?;
+            for ((index, bounds, _), coverage) in batch.iter().zip(rasterized) {
+                let input = &inputs[*index];
+                let offset = (bounds[2] - input.bounds[2]) * (input.bounds[1] - input.bounds[0]);
+                outputs[*index][offset..offset + coverage.len()].copy_from_slice(&coverage);
+            }
         }
         Ok(outputs)
     }
@@ -162,6 +169,34 @@ pub(super) fn coverage_batch(inputs: &[scanline::CoverageInput]) -> Result<Vec<V
             .collect());
     }
     let gpu = shared_gpu()?.ok_or_else(|| "SMAPH coverage has no wgpu adapter".to_owned())?;
+    if let Some(directory) = std::env::var_os("FUJIMOD_SMAPH_COVERAGE_CAPTURE_DIR") {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::PathBuf::from(directory)
+            .join(format!("coverage-{}-{index:06}.cbor", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("SMAPH coverage capture: {error}"))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let records: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.bounds,
+                    input.samples,
+                    &input.edges,
+                    input.stroke_radius,
+                    input.nonzero,
+                )
+            })
+            .collect();
+        ciborium::into_writer(&(1u32, records), &mut writer)
+            .map_err(|error| format!("SMAPH coverage capture encoding: {error}"))?;
+        std::io::Write::flush(&mut writer)
+            .map_err(|error| format!("SMAPH coverage capture flush: {error}"))?;
+    }
     gpu.coverage_batch(fujimod_emulator_gpu::context()?, inputs, &output_lengths)
 }
 
@@ -209,6 +244,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn large_paths_match_cpu_across_row_bands() {
+        if !require_gpu() {
+            return;
+        }
+        let contours: Vec<_> = (0..100)
+            .map(|index| {
+                let offset = f64::from(index % 7) / 8.0;
+                vec![
+                    [1.0 + offset, 0.0],
+                    [12.0, 0.0],
+                    [12.0, 12.0],
+                    [1.0 + offset, 12.0],
+                    [1.0 + offset, 0.0],
+                ]
+            })
+            .collect();
+        assert!(
+            scanline::CoverageInput::new(&contours, [0, 14, 0, 13], 4, None, true)
+                .edges
+                .len()
+                > 256
+        );
+        compare(&contours);
+    }
     #[test]
     fn authored_smaph_rectangle_matches_cpu_coverage() {
         if !require_gpu() {

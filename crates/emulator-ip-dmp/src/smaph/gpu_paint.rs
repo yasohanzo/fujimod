@@ -532,6 +532,171 @@ mod tests {
     use super::{paint, shared_gpu};
     use crate::smaph::{Bank, Gradient, Texture, blend_pixel, packed, pixel_index};
 
+    #[test]
+    fn resident_shader_uses_dense_coverage_index() {
+        let shader = include_str!("gpu_paint.wgsl");
+        naga::front::wgsl::parse_str(shader).expect("SMAPH paint WGSL should parse");
+        assert!(shader.contains("let output_index = output_row * params[67] + id.x;"));
+        assert!(shader.contains("let coverage_index = id.y * params[2] + id.x;"));
+        assert!(shader.contains("let covered = coverage[coverage_index];"));
+    }
+
+    #[test]
+    fn resident_padded_rows_and_flip_match_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        let context = fujimod_emulator_gpu::context().unwrap();
+        let _guard = context.acquire().unwrap();
+        let extent = [13, 7];
+        let bounds = [2, 11, 1, 6];
+        let coverage: Vec<u32> = (0..45).map(|i| [0, 1, 4][i % 3]).collect();
+        let regs = regs(false, false);
+        let gamma = gamma();
+        let clips = [[0, 0, 13, 7]];
+        for flip in [false, true] {
+            let target = target(123, extent[0], extent[1]);
+            let expected_box = cpu_paint(
+                &coverage,
+                bounds,
+                extent,
+                &target,
+                2,
+                &regs,
+                &gamma,
+                0x0100_0001,
+                false,
+                flip,
+                &clips,
+                [0x12, 0x34, 0x56, 0x78],
+                0,
+                None,
+                None,
+            );
+            let mut expected = target.clone();
+            for y in bounds[2]..bounds[3] {
+                for x in bounds[0]..bounds[1] {
+                    let source = ((y - bounds[2]) * 9 + x - bounds[0]) * 4;
+                    let row = if flip { extent[1] - 1 - y } else { y };
+                    let dest = (row * extent[0] + x) * 4;
+                    expected[dest..dest + 4].copy_from_slice(&expected_box[source..source + 4]);
+                }
+            }
+            let key = fujimod_emulator_gpu::SurfaceKey {
+                guest_address: 0x6000 + u64::from(flip) * 0x1000,
+                format: fujimod_emulator_gpu::SurfaceFormat::Rgba8,
+                extent: fujimod_emulator_gpu::SurfaceExtent {
+                    width: 13,
+                    height: 7,
+                },
+                layout: fujimod_emulator_gpu::SurfaceLayout::Linear,
+            };
+            let surface = context.get_or_create_target(key, Some(&target)).unwrap();
+            super::paint_resident(
+                &surface,
+                &coverage,
+                bounds,
+                extent,
+                &target,
+                2,
+                &regs,
+                &gamma,
+                0x0100_0001,
+                false,
+                flip,
+                &clips,
+                [0x12, 0x34, 0x56, 0x78],
+                0,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                context.readback(key).unwrap().bytes,
+                expected,
+                "flip={flip}"
+            );
+        }
+    }
+    #[test]
+    fn resident_tiled_order_257_matches_cpu() {
+        if !require_gpu() {
+            return;
+        }
+        let context = fujimod_emulator_gpu::context().unwrap();
+        let _guard = context.acquire().unwrap();
+        let extent = [720, 480];
+        let bounds = [0, 720, 0, 480];
+        let coverage: Vec<u32> = vec![16; 720 * 480];
+        let regs = regs(false, false);
+        let gamma = gamma();
+        let clips = [[0, 0, 720, 480]];
+        for flip in [false, true] {
+            let target = vec![0; extent[0] * extent[1] * 4];
+            let expected_box = cpu_paint(
+                &coverage,
+                bounds,
+                extent,
+                &target,
+                4,
+                &regs,
+                &gamma,
+                0x101,
+                true,
+                flip,
+                &clips,
+                [255, 0, 0, 0],
+                1,
+                None,
+                None,
+            );
+            let mut expected = target.clone();
+            for y in bounds[2]..bounds[3] {
+                for x in bounds[0]..bounds[1] {
+                    let source = ((y - bounds[2]) * 720 + x - bounds[0]) * 4;
+                    let row = if flip { extent[1] - 1 - y } else { y };
+                    let dest = pixel_index(x, row, extent[0], true) * 4;
+                    expected[dest..dest + 4].copy_from_slice(&expected_box[source..source + 4]);
+                }
+            }
+            let key = fujimod_emulator_gpu::SurfaceKey {
+                guest_address: 0x9000 + u64::from(flip) * 0x1000,
+                format: fujimod_emulator_gpu::SurfaceFormat::Rgba8,
+                extent: fujimod_emulator_gpu::SurfaceExtent {
+                    width: 720,
+                    height: 480,
+                },
+                layout: fujimod_emulator_gpu::SurfaceLayout::Morton8x8,
+            };
+            let surface = context.get_or_create_target(key, Some(&target)).unwrap();
+            super::paint_resident(
+                &surface,
+                &coverage,
+                bounds,
+                extent,
+                &target,
+                4,
+                &regs,
+                &gamma,
+                0x101,
+                true,
+                flip,
+                &clips,
+                [255, 0, 0, 0],
+                1,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                context.readback(key).unwrap().bytes,
+                expected,
+                "flip={flip}"
+            );
+        }
+    }
     fn require_gpu() -> bool {
         match shared_gpu() {
             Ok(Some(gpu)) => {
@@ -639,7 +804,11 @@ mod tests {
                 } else {
                     solid
                 };
-                let source = packed(source, regs, gamma, order).unwrap();
+                let source = if texture.is_some() || gradient.is_some() {
+                    packed(source, regs, gamma, order).unwrap()
+                } else {
+                    source
+                };
                 let pixel = blend_pixel(
                     source,
                     destination,

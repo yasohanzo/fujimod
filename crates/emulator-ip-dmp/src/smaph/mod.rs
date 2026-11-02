@@ -343,6 +343,7 @@ fn float24(word: u32) -> Result<f64, String> {
         ((word & 0x800000) << 8) | ((((word >> 16) & 127) + 64) << 23) | ((word & 65535) << 7);
     Ok(f32::from_bits(bits) as f64)
 }
+#[derive(Serialize, Deserialize)]
 struct Texture {
     width: usize,
     height: usize,
@@ -355,6 +356,7 @@ struct Texture {
     rotate: bool,
     opaque: bool,
 }
+#[derive(Serialize, Deserialize)]
 struct Gradient {
     matrix: [f64; 9],
     colors: Vec<u32>,
@@ -685,6 +687,7 @@ fn blend_pixel(source: [u8; 4], dest: &[u8], order: u32, coverage: f64, mode: u3
     }
 }
 
+#[derive(Serialize)]
 struct PreparedPaint<'a> {
     fill: &'a FillDraw,
     address: u64,
@@ -925,7 +928,7 @@ fn rectangles(
         let gpu_context = fujimod_emulator_gpu::context()?;
         let _gpu_guard = gpu_context.acquire()?;
         let gpu_coverages = gpu_coverage::coverage_batch(&coverage_inputs)?;
-        if verify_gpu {
+        let cpu_reference = if verify_gpu {
             let cpu_coverages: Vec<_> = coverage_inputs
                 .iter()
                 .map(scanline::coverage_image)
@@ -942,8 +945,15 @@ fn rectangles(
                     ));
                 }
             }
-            paint_cpu_draws(&prepared, &coverage_inputs, &cpu_coverages, &mut output)?;
-        }
+            Some(cpu_reference_output(
+                &prepared,
+                &coverage_inputs,
+                &cpu_coverages,
+                &output,
+            )?)
+        } else {
+            None
+        };
 
         let mut surfaces: BTreeMap<u64, Arc<fujimod_emulator_gpu::GpuSurface>> = BTreeMap::new();
         let mut write_flags: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
@@ -1060,13 +1070,31 @@ fn rectangles(
         for (address, surface) in &surfaces {
             let readback = gpu_context.readback(surface.key())?;
             if verify_gpu {
-                let cpu_bytes = &output.get(address).unwrap().2;
+                let cpu_bytes = &cpu_reference
+                    .as_ref()
+                    .and_then(|reference| reference.get(address))
+                    .ok_or("SMAPH CPU reference target is missing")?
+                    .2;
                 if cpu_bytes != &readback.bytes {
                     let offset = cpu_bytes
                         .iter()
                         .zip(&readback.bytes)
                         .position(|(cpu, gpu)| cpu != gpu)
                         .unwrap_or(cpu_bytes.len().min(readback.bytes.len()));
+                    if let Some(path) = std::env::var_os("FUJIMOD_SMAPH_FAILURE_CAPTURE") {
+                        let file = std::fs::OpenOptions::new()
+                            .write(true).create_new(true).open(path)
+                            .map_err(|error| format!("SMAPH failure capture: {error}"))?;
+                        let mut file = std::io::BufWriter::new(file);
+                        let bounds: Vec<_> = coverage_inputs.iter().map(|input| input.bounds).collect();
+                        ciborium::into_writer(
+                            &(1u32, address, offset, paths, fills, &prepared, bounds,
+                              &gpu_coverages, &output, &cpu_reference, &readback.bytes),
+                            &mut file,
+                        ).map_err(|error| format!("SMAPH failure capture encoding: {error}"))?;
+                        std::io::Write::flush(&mut file)
+                            .map_err(|error| format!("SMAPH failure capture flush: {error}"))?;
+                    }
                     return Err(format!(
                         "SMAPH GPU paint differs from CPU at target {address:#x}, byte {offset}"
                     ));
@@ -1083,7 +1111,8 @@ fn rectangles(
             }
         }
         if verify_gpu {
-            return Ok(output
+            return Ok(cpu_reference
+                .ok_or("SMAPH CPU reference output is missing")?
                 .into_iter()
                 .map(|(address, (_, _, bytes))| (address, bytes))
                 .collect());
@@ -1167,6 +1196,17 @@ fn paint_cpu_draws(
     Ok(())
 }
 
+fn cpu_reference_output(
+    prepared: &[PreparedPaint<'_>],
+    coverage_inputs: &[scanline::CoverageInput],
+    coverages: &[Vec<u32>],
+    guest_input: &BTreeMap<u64, (u32, u32, Vec<u8>)>,
+) -> Result<BTreeMap<u64, (u32, u32, Vec<u8>)>, String> {
+    let mut reference = guest_input.clone();
+    paint_cpu_draws(prepared, coverage_inputs, coverages, &mut reference)?;
+    Ok(reference)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,6 +1248,49 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+    }
+    #[test]
+    fn cpu_reference_paint_does_not_mutate_gpu_input() {
+        let fill = FillDraw {
+            sequence: 0,
+            stream: Stream::default(),
+        };
+        let prepared = [PreparedPaint {
+            fill: &fill,
+            address: 0x1000,
+            width: 1,
+            height: 1,
+            coverage_index: 0,
+            samples: 1,
+            clips: vec![[0, 0, 1, 1]],
+            order: 0x0100_0000,
+            tiled: false,
+            flip: false,
+            blend: 0,
+            texture: None,
+            gradient: None,
+            solid: [0x12, 0x34, 0x56, 0x78],
+        }];
+        let coverage_inputs = [scanline::CoverageInput::new(
+            &[],
+            [0, 1, 0, 1],
+            1,
+            None,
+            false,
+        )];
+        let coverages = [vec![1]];
+        let guest_input = BTreeMap::from([(0x1000, (1, 1, vec![1, 2, 3, 4]))]);
+
+        let cpu_reference = cpu_reference_output(
+            &prepared,
+            &coverage_inputs,
+            &coverages,
+            &guest_input,
+        )
+        .unwrap();
+
+        assert_eq!(guest_input[&0x1000].2, [1, 2, 3, 4]);
+        assert_eq!(cpu_reference[&0x1000].2, [0x12, 0x34, 0x56, 0x78]);
     }
     #[test]
     fn pending_dma_has_exact_deadline_early_noop_and_restorable_program_independent_effects() {
@@ -1975,3 +2058,6 @@ impl Device for Renderer {
 
 #[cfg(test)]
 mod transfer_tests;
+
+#[cfg(test)]
+mod capture_tests;

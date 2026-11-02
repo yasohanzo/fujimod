@@ -37,6 +37,12 @@
 //! first frame over the whole raster, linear sRGB through a declared X-Trans
 //! response. sRGB black reads [`BLACK`], white [`WHITE`]; no optical or
 //! spectral calibration is claimed. The tile phase at the buffer origin is
+//! A caller may supply a host RGB image ([`Control::with_sensor_image`]):
+//! the read-out then writes that image, scaled to the whole raster
+//! bilinearly, through the same response and tile phase in place of
+//! the virtual scene. The image is caller-owned (a local picture), not a
+//! catalog input.
+//!
 //! [`TILE_PHASE`] (line, sample): the 2.11 RAF writer stores 4032 lines of
 //! 6160 samples from buffer + 0x723c0, 38 lines down and 128 samples back
 //! (checked on an emulated RAF: the scene's edges move by exactly that), so
@@ -82,13 +88,17 @@ pub const TILE_PHASE: (u64, u64) = (4, 2);
 use crate::development::XTRANS;
 
 /// A sensor readout unit: its channel offset, level interrupt and the ticks
-/// a readout takes.
+/// a readout takes. With a frame period the readout begins at the first frame
+/// after its start (frames at multiples of the period, as the frame sync
+/// counts them) and the ticks count from that frame.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Readout {
     pub offset: u64,
     pub irq: u32,
     pub ticks: u64,
+    #[serde(default)]
+    pub frame_period: Option<u64>,
 }
 const READ: u8 = 0x82;
 
@@ -117,6 +127,9 @@ pub struct Control {
     readout_status: u32,
     /// The readout writes the declared sensor frame.
     sensor_frame: bool,
+    /// Host RGB image (width, height, rows of red, green and blue bytes)
+    /// written instead of the virtual scene.
+    sensor_image: Option<(u64, u64, std::sync::Arc<[u8]>)>,
 }
 impl Control {
     pub fn new(base: u64) -> Result<Self, String> {
@@ -132,6 +145,7 @@ impl Control {
             readout_due: None,
             readout_status: 0,
             sensor_frame: false,
+            sensor_image: None,
         })
     }
     /// A sensor readout unit at a channel offset.
@@ -139,6 +153,7 @@ impl Control {
         if ![0x80, 0xc0, 0x180].contains(&readout.offset)
             || !(32..512).contains(&readout.irq)
             || readout.ticks == 0
+            || readout.frame_period == Some(0)
         {
             return Err("Invalid X-Processor Pro sensor readout unit".into());
         }
@@ -151,6 +166,24 @@ impl Control {
             return Err(format!("unknown X-Processor Pro sensor frame {profile}"));
         }
         self.sensor_frame = true;
+        Ok(self)
+    }
+    /// The declared sensor frame takes its picture from a host RGB image of
+    /// `width` x `height` pixels instead of the virtual scene.
+    pub fn with_sensor_image(
+        mut self,
+        width: u64,
+        height: u64,
+        rgb: Vec<u8>,
+    ) -> Result<Self, String> {
+        if !self.sensor_frame
+            || !(1..=16384).contains(&width)
+            || !(1..=16384).contains(&height)
+            || width * height * 3 != rgb.len() as u64
+        {
+            return Err("Invalid X-Processor Pro sensor host image".into());
+        }
+        self.sensor_image = Some((width, height, rgb.into()));
         Ok(self)
     }
     /// Lines of the declared sensor frame into the programmed buffer.
@@ -183,7 +216,10 @@ impl Control {
             let sites = &XTRANS[((y + TILE_PHASE.0) % 6) as usize];
             for (x, sample) in line.chunks_exact_mut(2).enumerate() {
                 let color = sites[(x + TILE_PHASE.1 as usize) % 6] as usize;
-                let rgb = fujimod_virtual_scene::rgb(scene, x as u64, y);
+                let rgb = match &self.sensor_image {
+                    Some((w, h, image)) => bilinear(image, *w, *h, x as u64, y, width, lines),
+                    None => fujimod_virtual_scene::rgb(scene, x as u64, y),
+                };
                 sample.copy_from_slice(&response[usize::from(rgb[color])].to_le_bytes());
             }
             if cx.ram_write(destination + y * stride, &line).is_err() {
@@ -213,6 +249,25 @@ impl Control {
         }
     }
 }
+/// The host image at raster site (`x`, `y`) of a `width` x `height` raster,
+/// interpolated bilinearly between pixel centers (8-bit fixed point).
+fn bilinear(image: &[u8], w: u64, h: u64, x: u64, y: u64, width: u64, height: u64) -> [u8; 3] {
+    // Pixel-center position in 1/256 units, clamped to the image.
+    let at = |site: u64, sites: u64, size: u64| {
+        let p = ((2 * site + 1) * size * 256 / (2 * sites)).saturating_sub(128);
+        let p = p.min((size - 1) * 256);
+        ((p / 256) as usize, (p % 256) as u32)
+    };
+    let ((x0, fx), (y0, fy)) = (at(x, width, w), at(y, height, h));
+    let (x1, y1) = ((x0 + 1).min(w as usize - 1), (y0 + 1).min(h as usize - 1));
+    let pixel = |px: usize, py: usize, c: usize| u32::from(image[(py * w as usize + px) * 3 + c]);
+    [0, 1, 2].map(|c| {
+        let top = pixel(x0, y0, c) * (256 - fx) + pixel(x1, y0, c) * fx;
+        let bottom = pixel(x0, y1, c) * (256 - fx) + pixel(x1, y1, c) * fx;
+        ((top * (256 - fy) + bottom * fy + 32768) >> 16) as u8
+    })
+}
+
 impl Device for Control {
     fn name(&self) -> &'static str {
         "xpp-imaging-control"
@@ -249,7 +304,11 @@ impl Device for Control {
                 return;
             }
             if offset == r.offset && value & 1 != 0 && self.readout_due.is_none() {
-                self.readout_due = cx.now().checked_add(r.ticks);
+                let begin = match r.frame_period {
+                    Some(period) => (cx.now() / period + 1).checked_mul(period),
+                    None => Some(cx.now()),
+                };
+                self.readout_due = begin.and_then(|at| at.checked_add(r.ticks));
                 if self.readout_due.is_none() {
                     return cx.fail("Sensor readout deadline overflow");
                 }
@@ -414,6 +473,7 @@ mod tests {
             offset: 0xc0,
             irq: 98,
             ticks: 10,
+            frame_period: None,
         };
         assert!(
             Control::new(BASE)
@@ -445,11 +505,48 @@ mod tests {
     }
 
     #[test]
+    fn a_readout_on_frames_begins_at_the_next_frame() {
+        let readout = Readout {
+            offset: 0xc0,
+            irq: 98,
+            ticks: 10,
+            frame_period: Some(100),
+        };
+        assert!(
+            Control::new(BASE)
+                .unwrap()
+                .with_readout(Readout {
+                    frame_period: Some(0),
+                    ..readout
+                })
+                .is_err()
+        );
+        let mut control = Control::new(BASE).unwrap().with_readout(readout).unwrap();
+        let mut h = TestHost::new();
+        let unit = BASE + 0xc0;
+        write(&mut control, &mut h, unit + 0x1c, 1);
+        advance(&mut control, &mut h, 230);
+        write(&mut control, &mut h, unit, 1);
+        // Started at 230: the read-out begins with the frame at 300.
+        assert_eq!(control.next_deadline(230), Some(310));
+        advance(&mut control, &mut h, 309);
+        assert_eq!(read(&mut control, &mut h, unit + 0x20), 0);
+        advance(&mut control, &mut h, 310);
+        assert_eq!(read(&mut control, &mut h, unit + 0x20), 1);
+        // A start on a frame tick waits for the following frame.
+        write(&mut control, &mut h, unit + 0x20, 1);
+        advance(&mut control, &mut h, 400);
+        write(&mut control, &mut h, unit, 1);
+        assert_eq!(control.next_deadline(400), Some(510));
+    }
+
+    #[test]
     fn a_readout_with_a_sensor_frame_writes_x_trans_samples_of_the_scene() {
         let readout = Readout {
             offset: 0xc0,
             irq: 98,
             ticks: 10,
+            frame_period: None,
         };
         assert!(
             Control::new(BASE)
@@ -485,5 +582,42 @@ mod tests {
             [WHITE, WHITE, WHITE, BLACK, BLACK, BLACK, WHITE, BLACK]
         );
         assert_eq!(h.ram[0x1000 + 16 * 6], 0);
+    }
+
+    #[test]
+    fn a_sensor_host_image_replaces_the_scene_at_each_site() {
+        let readout = Readout {
+            offset: 0xc0,
+            irq: 98,
+            ticks: 10,
+            frame_period: None,
+        };
+        let control = || Control::new(BASE).unwrap().with_readout(readout).unwrap();
+        // Four red pixels, then four blue: one pixel center per sample.
+        let image = [[255, 0, 0]; 4]
+            .into_iter()
+            .chain([[0, 0, 255]; 4])
+            .flatten()
+            .collect::<Vec<u8>>();
+        assert!(control().with_sensor_image(8, 1, image.clone()).is_err());
+        let framed = || control().with_sensor_frame(SENSOR_PROFILE).unwrap();
+        assert!(framed().with_sensor_image(8, 2, image.clone()).is_err());
+        let mut control = framed().with_sensor_image(8, 1, image).unwrap();
+        let mut h = TestHost::new();
+        let unit = BASE + 0xc0;
+        write(&mut control, &mut h, unit + 0x08, 6);
+        write(&mut control, &mut h, unit + 0x0c, 0x1000);
+        write(&mut control, &mut h, unit + 0x10, 16);
+        write(&mut control, &mut h, unit, 1);
+        advance(&mut control, &mut h, 10);
+        let row: Vec<u16> = (0..8)
+            .map(|x| u16::from_le_bytes([h.ram[0x1000 + 2 * x], h.ram[0x1001 + 2 * x]]))
+            .collect();
+        // Sites B G G R | G G B G: the red half lights its R site, the blue
+        // half its B site.
+        assert_eq!(
+            row,
+            [BLACK, BLACK, BLACK, WHITE, BLACK, BLACK, WHITE, BLACK]
+        );
     }
 }

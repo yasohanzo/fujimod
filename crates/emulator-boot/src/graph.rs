@@ -864,6 +864,8 @@ mod tests {
             control_ids: None,
             first_start: None,
             bulk: None,
+            restart: None,
+            card_files: None,
             settings: None,
             flash: None,
             state: None,

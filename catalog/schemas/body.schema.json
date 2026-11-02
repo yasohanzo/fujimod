@@ -3295,6 +3295,11 @@
           "type": "string"
         },
         {
+          "const": "StillProcessor",
+          "description": "Shared still processor with body-declared CFA.",
+          "type": "string"
+        },
+        {
           "const": "SPI1SerialBus",
           "description": "S P I1 Serial Bus.",
           "type": "string"
@@ -7204,7 +7209,7 @@
     },
     "HardwareSensorReadout": {
       "additionalProperties": false,
-      "description": "Sensor read-out unit of the imaging control page: a started read-out\nfinishes after the declared ticks with its level interrupt.",
+      "description": "Sensor read-out unit of the imaging control page: a started read-out\nfinishes after the declared ticks with its level interrupt, counted from\nthe start or, with `starts_on_frame`, from the next frame of the frame sync.",
       "properties": {
         "basis": {
           "description": "Declared basis.",
@@ -7221,6 +7226,10 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "starts_on_frame": {
+          "description": "The read-out begins at the first frame of the frame sync after its\nstart, and its ticks count from that frame.",
+          "type": "boolean"
         },
         "ticks": {
           "description": "Device ticks a read-out takes.",

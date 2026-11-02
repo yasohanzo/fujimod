@@ -92,8 +92,15 @@ pub struct StockSdk {
     pub directory_context_bytes: u32,
     pub directory_attribute_offset: u32,
     pub directory_size_offset: u32,
+    /// Width of the checked SDK size field, independent of adjacent metadata.
+    #[serde(default = "default_directory_size_bytes")]
+    pub directory_size_bytes: u32,
     pub chunk_bytes: u32,
     pub end_of_directory_status: u32,
+}
+
+fn default_directory_size_bytes() -> u32 {
+    8
 }
 
 impl FirmwareCard {
@@ -154,7 +161,9 @@ impl FirmwareCard {
                     || p.directory_context_bytes < 48
                     || p.directory_context_bytes > 256
                     || p.directory_attribute_offset >= p.directory_context_bytes
-                    || u64::from(p.directory_size_offset) + 8 > u64::from(p.directory_context_bytes)
+                    || !matches!(p.directory_size_bytes, 4 | 8)
+                    || u64::from(p.directory_size_offset) + u64::from(p.directory_size_bytes)
+                        > u64::from(p.directory_context_bytes)
                 {
                     return Err("Invalid stock card SDK geometry".into());
                 }

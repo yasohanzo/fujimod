@@ -145,6 +145,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "directory_size_bytes": {
+              "default": 8,
+              "description": "Width of the checked SDK size field, independent of adjacent metadata.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "directory_size_offset": {
               "format": "uint32",
               "minimum": 0,

@@ -3219,6 +3219,7 @@ class MechanismVariant1(TypedDict, total=False):
     directory_context_bytes: Required[int]
     directory_first_code: Required[int]
     directory_next_code: Required[int]
+    directory_size_bytes: NotRequired[int]
     directory_size_offset: Required[int]
     dispatcher: Required[int]
     drive_map: Required[int]

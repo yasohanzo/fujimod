@@ -355,6 +355,7 @@ fn profile() -> FirmwareCard {
             directory_context_bytes: 120,
             directory_attribute_offset: 59,
             directory_size_offset: 80,
+            directory_size_bytes: 8,
             chunk_bytes: 64,
             end_of_directory_status: 6,
         })),
@@ -722,4 +723,31 @@ fn mounted_sdk_retains_uncertain_allocation_and_refuses_further_work() {
         assert!(camera.lock().unwrap().allocated);
         assert_eq!(session.state(), SessionState::CompletionUnknown);
     });
+}
+#[test]
+fn directory_size_width_defaults_and_invalid_geometry() {
+    let mut p = profile();
+    let Mechanism::StockSdk(sdk) = &mut p.mechanism else {
+        panic!()
+    };
+    let mut value = serde_json::to_value(&**sdk).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("directory_size_bytes");
+    let legacy: StockSdk = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.directory_size_bytes, 8);
+    sdk.directory_size_bytes = 4;
+    p.validate().unwrap();
+    let Mechanism::StockSdk(sdk) = &mut p.mechanism else {
+        panic!()
+    };
+    sdk.directory_size_bytes = 3;
+    assert!(p.validate().is_err());
+    let Mechanism::StockSdk(sdk) = &mut p.mechanism else {
+        panic!()
+    };
+    sdk.directory_size_bytes = 4;
+    sdk.directory_size_offset = u32::MAX;
+    assert!(p.validate().is_err());
 }

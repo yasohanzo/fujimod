@@ -50,6 +50,12 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=unicorn");
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    // Visual Studio generators place archives under the configuration name;
+    // single-configuration generators keep them directly in build/.
+    if target_env == "msvc" {
+        println!("cargo:rustc-link-search=native={}",
+            output.join("build").join(config.get_profile()).display());
+    }
     if target_env != "msvc" {
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=pthread");

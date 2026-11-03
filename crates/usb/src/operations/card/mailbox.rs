@@ -12,8 +12,13 @@ pub(super) struct Mailbox<'a> {
     capacity: u32,
     operations: u32,
     source: Option<u32>,
+    pub(super) trigger: Option<super::QueryTrigger>,
 }
 impl Mailbox<'_> {
+    pub(super) fn location(&self) -> u32 {
+        self.address
+    }
+
     fn address(&self, address: u32, size: u32) -> Result<u32> {
         let physical = address & !self.alias;
         require(
@@ -39,42 +44,104 @@ impl Mailbox<'_> {
         self.host.write(at, raw).await
     }
     async fn idle(&mut self) -> Result<()> {
+        let state = self.snapshot().await?;
         require(
-            self.read(self.address, 64).await? == self.descriptor,
-            "File-service descriptor changed",
-        )?;
-        require(
-            self.word(self.p[7]).await? == self.operations
-                && self.word(self.p[1]).await? == 0
-                && self.word(self.p[2]).await? != 1,
+            state[0] == self.operations && state[1] == 0 && state[2] != 1,
             "File service busy or another operation intervened",
         )
+    }
+    async fn snapshot(&mut self) -> Result<[u32; 6]> {
+        let mut fields = [
+            self.p[7], self.p[1], self.p[2], self.p[8], self.p[3], self.p[4],
+        ];
+        for field in &mut fields {
+            *field = self.address(*field, 4)?;
+        }
+        let descriptor_address = self.address(self.address, 64)?;
+        let start = fields
+            .iter()
+            .copied()
+            .chain([descriptor_address])
+            .min()
+            .unwrap();
+        let end = fields
+            .iter()
+            .map(|&a| u64::from(a) + 4)
+            .chain([u64::from(descriptor_address) + 64])
+            .max()
+            .unwrap();
+        let size = u32::try_from(end - u64::from(start)).map_err(|_| Error::InvalidLength)?;
+        // These are already checked RAM pointers in the service reservation.
+        // The owned helper puts them in one small span, so descriptor and
+        // completion guards cost one bounded command instead of seven waits.
+        let (descriptor, values) = if size <= 1024 {
+            let raw = self.read(start, size).await?;
+            let d = (descriptor_address - start) as usize;
+            (
+                raw[d..d + 64].to_vec(),
+                fields.map(|at| u32_at(&raw, (at - start) as usize)),
+            )
+        } else {
+            let mut ranges = vec![range(descriptor_address, 64)?];
+            ranges.extend(
+                fields
+                    .iter()
+                    .map(|&at| range(at, 4))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            let raw =
+                super::super::memory::read_ranges(self.host.session, &ranges, self.host.limits)
+                    .await?;
+            (
+                raw[0].clone(),
+                std::array::from_fn(|i| u32_at(&raw[i + 1], 0)),
+            )
+        };
+        require(
+            descriptor == self.descriptor,
+            "File-service descriptor changed",
+        )?;
+        Ok(values)
     }
     async fn command(&mut self, op: u32, size: u32) -> Result<u32> {
         require(size <= 0xffffff, "File-service argument too large")?;
         self.idle().await?;
         self.write(self.p[1], &words(&[op | size << 8])).await?;
+        if let Some(trigger) = self.trigger {
+            use crate::ff80::commands::diagnostic::DiagnosticTag;
+            use crate::operations::borrowed::BorrowedQueries;
+            let outputs = self.host.read(trigger.outputs, 8).await?;
+            let mut call = BorrowedQueries::new(
+                Address(trigger.slot),
+                Address(trigger.stock),
+                Address(trigger.outputs),
+                outputs,
+            )?;
+            call.call(
+                Address(trigger.entry),
+                DiagnosticTag::Research(trigger.argument),
+                vec![(0, 0)],
+                vec![0; 8],
+            )?;
+            call.invoke(self.host.session, self.host.limits).await?;
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            require(
-                self.read(self.address, 64).await? == self.descriptor,
-                "File-service descriptor changed",
-            )?;
-            let request = self.word(self.p[1]).await?;
-            let state = self.word(self.p[2]).await?;
+            let snapshot = self.snapshot().await?;
+            let request = snapshot[1];
+            let state = snapshot[2];
             if request == 0 && state != 1 {
                 require(
-                    self.word(self.p[7]).await? == self.operations.wrapping_add(1)
-                        && self.word(self.p[8]).await? == 0,
+                    snapshot[0] == self.operations.wrapping_add(1) && snapshot[3] == 0,
                     "File-service operation ownership changed",
                 )?;
                 self.operations = self.operations.wrapping_add(1);
-                let status = self.word(self.p[3]).await?;
+                let status = snapshot[4];
                 require(
                     state == 2 && status == 0,
                     &format!("File-service operation {op} failed: {status:#x}"),
                 )?;
-                return self.word(self.p[4]).await;
+                return Ok(snapshot[5]);
             }
             if Instant::now() >= deadline {
                 self.host.session.invalidate_completion();
@@ -199,6 +266,16 @@ impl Mailbox<'_> {
             Request::ReadAt { path, offset, size } => {
                 self.require_mount_abi()?;
                 self.path(&path).await?;
+                if u32_at(&self.descriptor, 56) & 1 != 0 && size <= self.capacity {
+                    self.write(self.p[6], &offset.to_le_bytes()).await?;
+                    let count = self.command(14, size).await?;
+                    require(count <= size, "Invalid file range read count")?;
+                    return Ok(Response::Bytes(if count == 0 {
+                        Vec::new()
+                    } else {
+                        self.read(self.p[6], count).await?
+                    }));
+                }
                 self.command(1, 0).await?;
                 self.seek(offset).await?;
                 let mut data = Vec::with_capacity(size as usize);
@@ -224,7 +301,9 @@ impl Mailbox<'_> {
                 self.source = Some(self.word(self.p[10]).await?);
                 self.host.put(self.address(self.p[10], 4)?, 0).await?;
                 for raw in data.chunks(self.capacity as usize) {
-                    self.write(self.p[6], raw).await?;
+                    self.host
+                        .write_owned(self.address(self.p[6], self.capacity)?, raw, self.capacity)
+                        .await?;
                     let n = self.command(6, raw.len() as u32).await?;
                     require(n as usize == raw.len(), "Short file write")?;
                 }
@@ -292,6 +371,7 @@ pub(super) async fn prepare<'a>(
     size: u32,
     alias: u32,
     build: Option<u32>,
+    hint: Option<u32>,
 ) -> Result<Mailbox<'a>> {
     require(
         start % 32 == 0
@@ -313,22 +393,41 @@ pub(super) async fn prepare<'a>(
         capacity: 0,
         operations: 0,
         source: None,
+        trigger: None,
     };
-    let raw = service.read(start, size).await?;
-    let found: Vec<_> = (0..raw.len() - 63)
-        .step_by(32)
-        .filter(|&i| {
-            u32_at(&raw, i) == 0x314c4946
-                && (1..=3).contains(&u32_at(&raw, i + 4))
-                && build.is_none_or(|v| u32_at(&raw, i + 8) == v)
-        })
-        .collect();
-    require(
-        found.len() == 1,
-        "No unique matching installed file service",
-    )?;
-    service.address = start + found[0] as u32;
-    service.descriptor = raw[found[0]..found[0] + 64].to_vec();
+    let matches = |raw: &[u8]| {
+        u32_at(raw, 0) == 0x314c4946
+            && (1..=3).contains(&u32_at(raw, 4))
+            && build.is_none_or(|v| u32_at(raw, 8) == v)
+    };
+    let mut descriptor = None;
+    if let Some(hint) = hint.filter(|h| {
+        *h % 32 == 0 && *h >= start && u64::from(*h) + 64 <= u64::from(start) + u64::from(size)
+    }) {
+        let raw = service.read(hint, 64).await?;
+        if matches(&raw) {
+            descriptor = Some((hint, raw));
+        }
+    }
+    let (location, descriptor) = if let Some(found) = descriptor {
+        found
+    } else {
+        let raw = service.read(start, size).await?;
+        let found: Vec<_> = (0..raw.len() - 63)
+            .step_by(32)
+            .filter(|&i| matches(&raw[i..i + 64]))
+            .collect();
+        require(
+            found.len() == 1,
+            "No unique matching installed file service",
+        )?;
+        (
+            start + found[0] as u32,
+            raw[found[0]..found[0] + 64].to_vec(),
+        )
+    };
+    service.address = location;
+    service.descriptor = descriptor;
     service.p = (0..11)
         .map(|i| u32_at(&service.descriptor, 12 + i * 4))
         .collect();
@@ -354,7 +453,7 @@ pub(super) async fn execute(
     build: Option<u32>,
     request: Request,
 ) -> Result<Response> {
-    let mut service = prepare(host, start, size, alias, build).await?;
+    let mut service = prepare(host, start, size, alias, build, None).await?;
     let result = service.transfer(request).await;
     if service.host.session.state() == crate::ff80::SessionState::Ready {
         service.finish().await?;

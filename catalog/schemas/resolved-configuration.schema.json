@@ -2261,6 +2261,28 @@
       ],
       "type": "object"
     },
+    "ConfigurationCheck": {
+      "additionalProperties": false,
+      "description": "A RAM configuration byte read before any destination is borrowed.",
+      "properties": {
+        "offset": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "value": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "value"
+      ],
+      "type": "object"
+    },
     "ConfigurationLocation": {
       "description": "A configuration block addressed directly or through a firmware pointer.",
       "oneOf": [
@@ -6910,6 +6932,17 @@
           "$ref": "#/$defs/BulkSource",
           "description": "Stock routine that points E1 reads at memory."
         },
+        "upload": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Upload"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Checked E0 destination for caller-owned data buffers."
+        },
         "window": {
           "$ref": "#/$defs/BulkRange",
           "description": "Addresses bulk reads may cover."
@@ -6959,6 +6992,17 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryService"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional owned service used when the stock interface cannot implement\nthe complete file namespace. The client supplies its compiled helper."
         }
       },
       "required": [
@@ -16625,7 +16669,7 @@
           "type": "integer"
         },
         "max_pages_per_call": {
-          "description": "One page per call, matching the stock physical-page caller.",
+          "description": "Qualified burst bound; callers also stop at erase-block boundaries.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -19438,6 +19482,79 @@
         "timer_channels",
         "quadrature",
         "initial_phase"
+      ],
+      "type": "object"
+    },
+    "QueryService": {
+      "additionalProperties": false,
+      "properties": {
+        "allocate": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "barrier": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_clean": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/CodeCheck"
+          },
+          "type": "array"
+        },
+        "configuration_pointer": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "functions": {
+          "description": "Stock file, dispatch, and cursor entrypoints in the helper ABI's order.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "instruction_barrier": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instruction_invalidate": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "release": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "worker_slots": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "allocate",
+        "release",
+        "configuration_pointer",
+        "cache_clean",
+        "instruction_invalidate",
+        "barrier",
+        "instruction_barrier",
+        "worker_slots",
+        "functions",
+        "checks"
       ],
       "type": "object"
     },
@@ -25556,6 +25673,60 @@
         "address",
         "size",
         "sha256"
+      ],
+      "type": "object"
+    },
+    "Upload": {
+      "additionalProperties": false,
+      "description": "Located stock E0 upload destination and its independently checked code.",
+      "properties": {
+        "address_alignment": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capacity_address": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "code_checks": {
+          "items": {
+            "$ref": "#/$defs/CodeCheck"
+          },
+          "type": "array"
+        },
+        "configuration_checks": {
+          "description": "Existing RAM configuration required by a side-effect-free setup branch.",
+          "items": {
+            "$ref": "#/$defs/ConfigurationCheck"
+          },
+          "type": "array"
+        },
+        "piece_bytes": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pointer": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pointer_bytes": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pointer",
+        "pointer_bytes",
+        "configuration_checks",
+        "capacity_address",
+        "piece_bytes",
+        "address_alignment",
+        "code_checks"
       ],
       "type": "object"
     },

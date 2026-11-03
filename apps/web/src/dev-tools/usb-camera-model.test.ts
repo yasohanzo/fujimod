@@ -162,6 +162,8 @@ class CameraDevice implements ModelDevice {
         device: { kind: 'serial-nand', part: 'Fixture' },
         size: 4,
         sha256: 'a'.repeat(64),
+        uncorrectablePageOffsets: [],
+        uncorrectableGranularityBytes: 0,
       }),
       dumpState: async () => {},
       memory: async () => ({
@@ -1243,7 +1245,13 @@ test('service preparation, flash chunks and state regions use the owned workflow
     async (_id, _metadata, _image, sink, progress) => {
       sink({ offset: 4, data: Uint8Array.of(5, 6) });
       progress?.(2, 2);
-      return { device: { kind: 'serial-nand', part: 'Fixture' }, size: 2, sha256: 'b'.repeat(64) };
+      return {
+        device: { kind: 'serial-nand', part: 'Fixture' },
+        size: 2,
+        sha256: 'b'.repeat(64),
+        uncorrectablePageOffsets: [],
+        uncorrectableGranularityBytes: 0,
+      };
     },
   );
   const dump = vi.fn<ModelSession['dumpState']>(async (_id, sink, progress) => {

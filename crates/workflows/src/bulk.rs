@@ -108,6 +108,40 @@ impl BulkMapping {
             dma: bulk.dma,
         })
     }
+    /// Borrow only the located E1 publication words. Unlike pattern setup this
+    /// does not fill diagnostic scratch, so reads preserve the requested RAM.
+    /// Restore before yielding the exclusive ff80 transaction to another client.
+    pub async fn prepare_preserving(
+        session: &mut Session,
+        bulk: &FirmwareBulk,
+        limits: Limits,
+    ) -> Result<Self> {
+        let alignment = bulk
+            .dma
+            .map(|dma| DataAlignment::new(dma.address_alignment, dma.length_granule))
+            .transpose()?;
+        check_identity(session, bulk).await?;
+        let mut access = Access { session, limits };
+        check_code(&mut access, bulk).await?;
+        let mut source = Source::borrow(&mut access, bulk).await?;
+        if let Some(alignment) = alignment {
+            source.window = source.window.with_alignment(alignment);
+        }
+        if let Err(error) = source.qualify(&mut access, bulk).await {
+            let restored = source.restore(&mut access).await;
+            if restored.is_err() {
+                access.session.invalidate_completion();
+            }
+            return finish(Err(error), restored);
+        }
+        Ok(Self {
+            source,
+            window: bulk.window,
+            limits,
+            dma: bulk.dma,
+        })
+    }
+
     /// Diagnostic scratch the stock setup overwrote (`address`, `size`).
     pub fn overwritten(&self) -> Option<(u64, u32)> {
         self.source.overwritten
@@ -132,7 +166,7 @@ impl BulkMapping {
     }
 }
 
-impl fujimod_usb::operations::card::RangeRead for BulkMapping {
+impl fujimod_usb::operations::card::BufferIo for BulkMapping {
     fn admits(&self, address: u32, size: u32) -> bool {
         self.enclosing(address, size).is_some()
     }
@@ -202,6 +236,18 @@ pub(crate) struct Qualified<'a> {
     source: Source,
 }
 impl<'a> Qualified<'a> {
+    pub(crate) async fn prepare_preserving(
+        session: &'a mut Session,
+        bulk: &FirmwareBulk,
+        limits: Limits,
+    ) -> Result<Self> {
+        let mapping = BulkMapping::prepare_preserving(session, bulk, limits).await?;
+        Ok(Self {
+            access: Access { session, limits },
+            source: mapping.source,
+        })
+    }
+
     pub(crate) async fn prepare(
         session: &'a mut Session,
         bulk: &FirmwareBulk,
@@ -213,16 +259,11 @@ impl<'a> Qualified<'a> {
             .transpose()?;
         check_identity(session, bulk).await?;
         let mut access = Access { session, limits };
-        for check in &bulk.code_checks {
-            let bytes = access
-                .raw(check.address | bulk.code_alias, check.size)
-                .await?;
-            require(
-                hex(&checks::sha256_bytes(&bytes)) == check.sha256,
-                &format!("Stock code differs: {}", check.name),
-            )?;
-        }
-        let mut source = Source::prepare(&mut access, bulk).await?;
+        check_code(&mut access, bulk).await?;
+        let mut source = match bulk.source {
+            BulkSource::Query { .. } => Source::prepare(&mut access, bulk).await?,
+            _ => Source::borrow(&mut access, bulk).await?,
+        };
         if let Some(alignment) = alignment {
             source.window = source.window.with_alignment(alignment);
         }
@@ -307,8 +348,40 @@ pub(crate) async fn check_camera(
     )
 }
 
+async fn check_code(access: &mut Access<'_>, bulk: &FirmwareBulk) -> Result<()> {
+    let ranges = bulk
+        .code_checks
+        .iter()
+        .map(|check| {
+            memory_range(BulkRange {
+                address: check.address | bulk.code_alias,
+                size: check.size,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bytes = memory::read_ranges(access.session, &ranges, access.limits.memory).await?;
+    for (check, bytes) in bulk.code_checks.iter().zip(bytes) {
+        require(
+            hex(&checks::sha256_bytes(&bytes)) == check.sha256,
+            &format!("Stock code differs: {}", check.name),
+        )?;
+    }
+    Ok(())
+}
+
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+}
+
+// The generated counting pattern is 64 KiB, but that is not an E1 transport
+// limit. Its checked echo arm can publish up to the registered data capacity.
+// Borrow that same bound without generating a pattern or touching its buffer.
+fn transfer_capacity(access: &Access<'_>, registered: u32, pattern: u32) -> Result<u32> {
+    require(
+        registered >= pattern && pattern > 0,
+        "Registered E1 capacity is unavailable",
+    )?;
+    Ok(registered.min(access.session.max_reply_bytes().get()))
 }
 
 /// The prepared E1 source: how offsets map to addresses, and what to restore.
@@ -320,6 +393,84 @@ struct Source {
     saved: Option<(u64, Vec<u8>, Vec<Vec<u8>>)>,
 }
 impl Source {
+    async fn borrow(access: &mut Access<'_>, bulk: &FirmwareBulk) -> Result<Self> {
+        let aperture = memory_range(bulk.window)?;
+        let (state, original, selected, capacity) = match &bulk.source {
+            BulkSource::Query { source_state, .. } => {
+                // The callback and diagnostic dispatcher use the cacheable
+                // publication cell. Borrow and restore that same view; writing
+                // its uncached alias can be overwritten by a dirty cache line.
+                let state = *source_state & !bulk.code_alias;
+                let original = access.raw(state, 8).await?;
+                let mut source = match Self::prepare(access, bulk).await {
+                    Ok(source) => source,
+                    Err(error) => {
+                        if access.session.state() == SessionState::Ready
+                            && access.raw(state, 8).await? != original
+                        {
+                            access.session.invalidate_completion();
+                        }
+                        return Err(error);
+                    }
+                };
+                let selected = access.raw(state, 8).await?;
+                source.saved = Some((state, original.clone(), vec![original, selected]));
+                return Ok(source);
+            }
+            BulkSource::Pattern {
+                source_state,
+                registered_buffer,
+                capacity,
+            } => {
+                let descriptor = access.raw(*registered_buffer, 8).await?;
+                let capacity = transfer_capacity(access, word(&descriptor, 4), *capacity)?;
+                let original = access.raw(*source_state, 8).await?;
+                let mut selected = vec![0; 4];
+                selected.extend(capacity.to_le_bytes());
+                (*source_state, original, selected, capacity)
+            }
+            BulkSource::PatternZeroBase {
+                source_state,
+                registered_buffer,
+                capacity,
+                ..
+            } => {
+                let descriptor = access.raw(*registered_buffer, 12).await?;
+                let capacity = transfer_capacity(access, word(&descriptor, 8), *capacity)?;
+                let original = access.raw(*source_state, 12).await?;
+                let mut selected = vec![0; 8];
+                selected.extend(capacity.to_le_bytes());
+                (*source_state, original, selected, capacity)
+            }
+        };
+        let source = Self {
+            window: DataWindow::new(
+                Address(0),
+                aperture,
+                NonZeroU32::new(capacity).ok_or(fujimod_usb::Error::InvalidLength)?,
+                OffsetMode::Checked,
+            )?,
+            overwritten: None,
+            saved: Some((state, original.clone(), vec![original, selected.clone()])),
+        };
+        let outcome = async {
+            access.write(state, &selected).await?;
+            require(
+                access.raw(state, selected.len() as u64).await? == selected,
+                "Borrowed E1 publication did not read back",
+            )
+        }
+        .await;
+        if let Err(error) = outcome {
+            let restored = source.restore(access).await;
+            if restored.is_err() {
+                access.session.invalidate_completion();
+            }
+            return finish(Err(error), restored);
+        }
+        Ok(source)
+    }
+
     async fn prepare(access: &mut Access<'_>, bulk: &FirmwareBulk) -> Result<Self> {
         let nonzero = |n: u32| NonZeroU32::new(n).ok_or(fujimod_usb::Error::InvalidLength);
         let aperture = memory_range(bulk.window)?;
@@ -359,7 +510,7 @@ impl Source {
                     reply.status == CommandStatus::Success,
                     "Bulk source query refused",
                 )?;
-                let state = access.raw(source_state, 8).await?;
+                let state = access.raw(source_state & !alias, 8).await?;
                 let capacity = word(&state, 4);
                 require(
                     u64::from(word(&state, 0)) == base

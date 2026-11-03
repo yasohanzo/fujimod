@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{borrow::BorrowMut, num::NonZeroU32};
 
-/// Pull-based range download, one bounded command per `next_chunk().await`.
+/// Pull-based range download, a bounded command batch per `next_chunk().await`.
 ///
 /// Retains progress without accumulating the full range. If a chunk fails,
 /// previously returned chunks remain valid and no retry is issued automatically.
@@ -50,12 +50,13 @@ impl<S: BorrowMut<Session>> MemoryReader<S> {
                 limit: budget,
             });
         }
-        let Some(range) = chunk(self.range, self.offset, maximum) else {
+        // Keep the protocol's packet bound, but amortize language/relay waits
+        // over a batch. Large captures use E1; this also speeds fallback reads.
+        let yield_bytes = maximum.saturating_mul(BATCH_COMMANDS as u32).min(1 << 20);
+        let Some(range) = chunk(self.range, self.offset, yield_bytes) else {
             return Ok(None);
         };
-        let data = session
-            .read_memory(ReadMemory::new(range, self.limits)?)
-            .await?;
+        let data = read_range(session, range, self.limits).await?;
         self.offset += range.length().get();
         Ok(Some(data))
     }
@@ -81,6 +82,16 @@ pub async fn read_range(
     range: MemoryRange,
     limits: DebugMemoryLimits,
 ) -> Result<Vec<u8>> {
+    Ok(read_ranges(session, &[range], limits).await?.remove(0))
+}
+
+/// Read disjoint spans in bounded command batches, without reading their gaps.
+/// Returned buffers have the same order and exact lengths as the input spans.
+pub async fn read_ranges(
+    session: &mut Session,
+    ranges: &[MemoryRange],
+    limits: DebugMemoryLimits,
+) -> Result<Vec<Vec<u8>>> {
     let budget = session.max_reply_bytes().get();
     let maximum = limits
         .read
@@ -94,17 +105,25 @@ pub async fn read_range(
         });
     }
     let mut commands = Vec::new();
-    let mut offset = 0;
-    while let Some(part) = chunk(range, offset, maximum) {
-        commands.push(ReadMemory::new(part, limits)?);
-        offset += part.length().get();
+    for (index, &range) in ranges.iter().enumerate() {
+        let mut offset = 0;
+        while let Some(part) = chunk(range, offset, maximum) {
+            commands.push((index, ReadMemory::new(part, limits)?));
+            offset += part.length().get();
+        }
     }
-    let mut data = Vec::with_capacity(range.length().get() as usize);
+    let mut data: Vec<Vec<u8>> = ranges
+        .iter()
+        .map(|range| Vec::with_capacity(range.length().get() as usize))
+        .collect();
     let mut commands = commands.into_iter().peekable();
     while commands.peek().is_some() {
-        let group: Vec<ReadMemory> = commands.by_ref().take(BATCH_COMMANDS).collect();
-        for part in session.read_memory_many(group).await? {
-            data.extend_from_slice(&part);
+        let (indices, group): (Vec<_>, Vec<_>) = commands.by_ref().take(BATCH_COMMANDS).unzip();
+        for (index, part) in indices
+            .into_iter()
+            .zip(session.read_memory_many(group).await?)
+        {
+            data[index].extend_from_slice(&part);
         }
     }
     Ok(data)

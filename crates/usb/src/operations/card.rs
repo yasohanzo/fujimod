@@ -19,9 +19,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A caller-qualified reader can accelerate owned buffers without changing
-/// file protocols. It must bound DMA to its own admitted address aperture.
-pub trait RangeRead: Send {
+/// Bound one request while the backend streams through its owned buffer.
+pub const MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Caller-qualified buffer transports keep file protocols independent of USB
+/// acceleration. Reads bound DMA to an admitted aperture; uploads own their padding.
+pub trait BufferIo: Send {
+    /// Admit an owned DMA upload. Cached-buffer callers clean/invalidate before
+    /// delegation, then synchronize again before the device consumes the data.
+    fn admits_write(&self, _address: u32, _size: u32, _capacity: u32) -> bool {
+        false
+    }
+
+    /// Return true after uploading only within this caller-owned buffer. False
+    /// selects bounded CPU writes. Control words always use the CPU writer.
+    fn write_owned<'a>(
+        &'a mut self,
+        _session: &'a mut Session,
+        _address: u32,
+        _data: &'a [u8],
+        _capacity: u32,
+    ) -> crate::emulator::EndpointFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
     fn admits(&self, address: u32, size: u32) -> bool;
     fn read<'a>(
         &'a mut self,
@@ -32,6 +52,15 @@ pub trait RangeRead: Send {
 }
 
 mod mailbox;
+/// A client-owned service entered through a temporarily borrowed query slot.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryTrigger {
+    pub slot: u32,
+    pub stock: u32,
+    pub outputs: u32,
+    pub entry: u32,
+    pub argument: u32,
+}
 #[cfg(test)]
 mod protocol_tests;
 mod sdk;
@@ -118,11 +147,11 @@ fn validate_request(request: &Request) -> Result<()> {
     match request {
         Request::Shrink { size, .. } => require(*size != 0, "Use Create to truncate to zero"),
         Request::ReadAt { offset, size, .. } => require(
-            *size <= 1024 * 1024 && offset.checked_add(*size).is_some(),
+            *size <= MAX_REQUEST_BYTES && offset.checked_add(*size).is_some(),
             "Invalid bounded card read",
         ),
         Request::WriteAt { offset, data, .. } => require(
-            data.len() <= 1024 * 1024
+            data.len() <= MAX_REQUEST_BYTES as usize
                 && u64::from(*offset) + data.len() as u64 <= u64::from(u32::MAX),
             "Invalid bounded card write",
         ),
@@ -155,9 +184,9 @@ fn path(value: &str, listing: bool) -> Result<()> {
         "Only SD0 A-drive paths are allowed",
     )?;
     require(
-        b[3..].iter().all(|c| {
-            c.is_ascii_alphanumeric() || b"._-\\".contains(c) || listing && b"*?".contains(c)
-        }),
+        b[3..]
+            .iter()
+            .all(|c| is_short_name_byte(*c) || *c == b'\\' || listing && b"*?".contains(c)),
         "Invalid card path",
     )?;
     require(
@@ -168,22 +197,37 @@ fn path(value: &str, listing: bool) -> Result<()> {
     )
 }
 
+/// ASCII characters accepted in FAT short names, including generated aliases.
+pub fn is_short_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b".$%'-_@~`!(){}^#&".contains(&byte)
+}
+
 struct Host<'a> {
     session: &'a mut Session,
     limits: DebugMemoryLimits,
-    reader: Option<&'a mut dyn RangeRead>,
+    io: Option<&'a mut dyn BufferIo>,
 }
 impl Host<'_> {
     async fn read(&mut self, address: u32, size: u32) -> Result<Vec<u8>> {
-        if size >= 512 {
-            if let Some(reader) = self.reader.as_mut().filter(|r| r.admits(address, size)) {
-                return reader.read(self.session, address, size).await;
-            }
+        if let Some(reader) = self.io.as_mut().filter(|r| r.admits(address, size)) {
+            return reader.read(self.session, address, size).await;
         }
         read_range(self.session, range(address, size)?, self.limits).await
     }
     async fn write(&mut self, address: u32, raw: &[u8]) -> Result<()> {
         write_range(self.session, Address(address), raw, self.limits).await
+    }
+    async fn write_owned(&mut self, address: u32, raw: &[u8], capacity: u32) -> Result<()> {
+        if let Some(io) = self
+            .io
+            .as_mut()
+            .filter(|io| io.admits_write(address, raw.len() as u32, capacity))
+        {
+            if io.write_owned(self.session, address, raw, capacity).await? {
+                return Ok(());
+            }
+        }
+        self.write(address, raw).await
     }
     async fn word(&mut self, address: u32) -> Result<u32> {
         Ok(u32_at(&self.read(address, 4).await?, 0))
@@ -235,7 +279,7 @@ pub async fn execute(
     let mut host = Host {
         session,
         limits,
-        reader: None,
+        io: None,
     };
     for c in &capability.code_checks {
         let bytes = host

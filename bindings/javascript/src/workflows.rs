@@ -437,6 +437,16 @@ impl FlashBackup {
         property(&result, "device", device);
         property(&result, "size", backup.size as f64);
         property(&result, "sha256", backup.sha256);
+        let uncorrectable = js_sys::Array::new();
+        for offset in backup.uncorrectable_page_offsets {
+            uncorrectable.push(&JsValue::from_f64(offset as f64));
+        }
+        property(&result, "uncorrectablePageOffsets", uncorrectable);
+        property(
+            &result,
+            "uncorrectableGranularityBytes",
+            backup.uncorrectable_granularity_bytes,
+        );
         Ok(result.into())
     }
 }
@@ -461,5 +471,7 @@ export interface FlashBackupResult {
     device: { kind: string; part?: string };
     size: number;
     sha256: string;
+    uncorrectablePageOffsets: number[];
+    uncorrectableGranularityBytes: number;
 }
 "#;

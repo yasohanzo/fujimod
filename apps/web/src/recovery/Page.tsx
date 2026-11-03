@@ -186,26 +186,43 @@ export default function Recovery() {
                     <BatteryCycleIcon />
                     Switch the camera OFF, then remove and reinsert the battery.
                   </p>
-                  <p>
-                    Hold these while switching it on, and keep holding until{' '}
-                    {downloadType() === 'green-led'
-                      ? 'the green LED lights:'
-                      : 'the screen lights:'}
-                  </p>
-                  <Show
-                    when={result().sdBoot}
-                    fallback={
-                      <p class="recovery-error">
-                        The {result().model}’s SD boot buttons are not in the catalog yet.
-                      </p>
-                    }
-                  >
-                    {(controls) => (
-                      <PowerComboKeys
-                        controls={controls()}
-                        modes={downloadType() === 'green-led' ? ['sd'] : ['sd', 'firmware_update']}
-                      />
-                    )}
+                  {(() => {
+                    const keys = (modes: ('sd' | 'firmware_update')[]) => (
+                      <Show when={result().sdBoot}>
+                        {(controls) => <PowerComboKeys controls={controls()} modes={modes} />}
+                      </Show>
+                    );
+                    return (
+                      <Show
+                        when={downloadType() !== 'green-led' && result().systemStartupLamp}
+                        fallback={
+                          <>
+                            <p>
+                              Hold these while switching it on, and keep holding until{' '}
+                              {downloadType() === 'green-led'
+                                ? 'the green LED lights:'
+                                : 'the screen lights:'}
+                            </p>
+                            {keys(
+                              downloadType() === 'green-led' ? ['sd'] : ['sd', 'firmware_update'],
+                            )}
+                          </>
+                        }
+                      >
+                        <p>Hold these while switching it on, until the green LED lights:</p>
+                        {keys(['sd'])}
+                        <p>
+                          Then release them and hold this until the screen lights, which can take a
+                          few minutes:
+                        </p>
+                        {keys(['firmware_update'])}
+                      </Show>
+                    );
+                  })()}
+                  <Show when={!result().sdBoot}>
+                    <p class="recovery-error">
+                      The {result().model}’s SD boot buttons are not in the catalog yet.
+                    </p>
                   </Show>
                   <aside class="recovery-led">
                     <p>

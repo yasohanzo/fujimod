@@ -164,6 +164,12 @@ covers flash-offset order. Cleanup verifies ownership and restores the callback,
 executable reservation, source, scratch and original debug gate. Unknown
 completion sends no further commands. A sink error stops capture and runs the
 same cleanup.
+`flash::read_range` provides random access through the same checked readers.
+It rounds only the requested range to the driver's page alignment, checks the
+control page, and returns the requested bytes after restoring borrowed state.
+It does not perform a whole-device backup for a small read. `flash::Artifact`
+shares the separately stored image metadata with the offline builder.
+
 `flash::Callbacks` supplies chunk delivery and byte progress separately.
 Progress starts at zero, advances after each delivered chunk and excludes the
 control read. Progress callback errors follow the same cleanup path as sink
@@ -193,3 +199,18 @@ EXR II preparation also requires an explicit function index, checks its
 allocator/configuration candidates against initialized update bytes, locates
 CPU0 cache helpers by immutable fingerprints, and rejects absolute references
 into the compiled entrypoints' link image.
+
+Capture defaults use the live registered E1 capacity within the session budget;
+the 64 KiB diagnostic counting pattern does not cap bulk RAM transfers. Larger
+browser memory reads borrow that publication without overwriting scratch.
+Bounded debug-memory streams batch commands before yielding to the host.
+
+Flash captures publish their callback once for the exclusive capture, verify
+ownership before each execution, and restore it before releasing code. The
+query/heap reader uses a 1 MiB buffer and located NAND burst limits, stopping at
+erase-block boundaries. Failed nonblank or partial bursts are reread page by
+page. Completed erased ECC bursts flag every covered page; the returned
+`uncorrectable_granularity_bytes` reports the maximum observation span. The
+command-callback reader uses a 60 KiB buffer inside its 64 KiB executable
+reservation. The native backup example records elapsed workflow time, progress
+and command counts/timings alongside the verified file coverage and hash.

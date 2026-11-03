@@ -3,7 +3,7 @@ use super::{Backup, CodeCheck};
 use crate::{
     Limits,
     bulk::{self, BulkError, Qualified},
-    callback::{check_code, require, word, write},
+    callback::{CallbackLease, check_code, require, word, write},
 };
 use fujimod_catalog::capture::FirmwareFlash;
 use fujimod_catalog_bulk::{BulkRange, BulkSource, FirmwareBulk};
@@ -19,10 +19,9 @@ use fujimod_usb::{
 };
 use serde::{Deserialize, Serialize};
 
-const ALLOCATION: u32 = 0xa020;
 const REQUEST: u64 = 0x1000;
 const BUFFER: u64 = 0x2000;
-const CAPACITY: u64 = 0x8000;
+const CAPACITY: u64 = super::CAPTURE_CHUNK_BYTES as u64;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "mechanism", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Configuration {
@@ -38,6 +37,7 @@ pub struct Payload {
     pub sha256: String,
     pub bootstrap_size: u32,
     pub reader_offset: u32,
+    pub observer_offset: u32,
     pub allocate: u32,
     pub release: u32,
     pub configuration: Configuration,
@@ -58,7 +58,7 @@ impl Payload {
     ) -> bulk::Result<()> {
         flash.validate().map_err(BulkError::Check)?;
         require(
-            self.schema == 1
+            self.schema == 6
                 && self.firmware_id == flash.firmware_id
                 && self.firmware_id == bulk.firmware_id,
             "Flash payload and catalog firmware differ",
@@ -77,6 +77,10 @@ impl Payload {
             self.bootstrap_size > 0
                 && self.bootstrap_size <= 32
                 && self.reader_offset == 32
+                && self.observer_offset > self.reader_offset
+                && self.observer_offset.is_multiple_of(4)
+                && u64::from(self.observer_offset) + 4 == image.len() as u64
+                && image[self.observer_offset as usize..] == [0x1e, 0xff, 0x2f, 0xe1]
                 && image.len() > 32
                 && image.len() <= REQUEST as usize
                 && self.sha256 == bulk::hex(&sha256_bytes(image)),
@@ -236,29 +240,56 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|n| n.to_le_bytes()).collect()
 }
 
-pub async fn backup(
+async fn configuration_flags(session: &mut Session, limits: Limits) -> bulk::Result<[u8; 2]> {
+    let mut flags = [0; 2];
+    for (value, offset) in flags.iter_mut().zip([0xa3, 0xf7]) {
+        *value = configuration::read_byte(
+            session,
+            ConfigurationView::Ram,
+            offset,
+            limits.configuration,
+        )
+        .await?;
+    }
+    Ok(flags)
+}
+
+async fn require_debug_access(session: &mut Session, limits: Limits) -> bulk::Result<[u8; 2]> {
+    let flags = configuration_flags(session, limits).await?;
+    // The page reader needs debug transport, not service-mode teardown policy.
+    // Service-session callers prepare their reset guard before this workflow.
+    require(
+        flags[1] == 1,
+        "Existing debug access is required for NAND backup",
+    )?;
+    Ok(flags)
+}
+
+async fn verify_configuration_flags(
+    session: &mut Session,
+    limits: Limits,
+    before: [u8; 2],
+) -> bulk::Result<()> {
+    require(
+        configuration_flags(session, limits).await? == before,
+        "Configuration flags changed during NAND backup",
+    )
+}
+
+pub(crate) async fn read(
     session: &mut Session,
     bulk: &FirmwareBulk,
     flash: &FirmwareFlash,
     payload: &Payload,
     image: &[u8],
     limits: Limits,
+    selection: super::Selection,
     callbacks: &mut super::Callbacks<'_>,
 ) -> bulk::Result<Backup> {
     payload.validate(flash, bulk, image)?;
-    (callbacks.progress)(0, flash.window.size).map_err(BulkError::Check)?;
-    require(
-        configuration::read_byte(session, ConfigurationView::Ram, 0xa3, limits.configuration)
-            .await?
-            == 1,
-        "Existing reset guard must be 1",
-    )?;
-    require(
-        configuration::read_byte(session, ConfigurationView::Ram, 0xf7, limits.configuration)
-            .await?
-            == 1,
-        "Prepare the service session before NAND backup",
-    )?;
+    let target = selection.range(flash);
+    (callbacks.progress)(0, target.size).map_err(BulkError::Check)?;
+    let flags_before = require_debug_access(session, limits).await?;
     let BulkSource::Query {
         callback_table,
         callback_offset,
@@ -271,7 +302,11 @@ pub async fn backup(
     };
     let mut access = bulk::Access { session, limits };
     let initial_source = access.raw(source_state, 8).await?;
-    let mut reader = Qualified::prepare(access.session, bulk, limits).await?;
+    let mut reader = if selection.preserves_source() {
+        Qualified::prepare_preserving(access.session, bulk, limits).await?
+    } else {
+        Qualified::prepare(access.session, bulk, limits).await?
+    };
     let prepared_source = reader.access.raw(source_state, 8).await?;
     let table = word(&reader.access.raw(callback_table, 4).await?) & !bulk.code_alias;
     require(
@@ -286,7 +321,19 @@ pub async fn backup(
         stock: stock_callback as u32,
         outputs: source_state & !bulk.code_alias,
     };
-    let outcome = execute(&mut reader, &query, bulk, flash, payload, image, callbacks).await;
+    let outcome = execute(
+        &mut reader,
+        &query,
+        bulk,
+        flash,
+        payload,
+        image,
+        target,
+        selection.controller_mode(),
+        selection.allows_uncorrectable(),
+        callbacks,
+    )
+    .await;
     let cleanup = async {
         reader.restore().await?;
         require(
@@ -304,19 +351,7 @@ pub async fn backup(
             &initial_source,
         )
         .await?;
-        for offset in [0xa3, 0xf7] {
-            require(
-                configuration::read_byte(
-                    reader.access.session,
-                    ConfigurationView::Ram,
-                    offset,
-                    limits.configuration,
-                )
-                .await?
-                    == 1,
-                "Service flags changed during NAND backup",
-            )?;
-        }
+        verify_configuration_flags(reader.access.session, limits, flags_before).await?;
         Ok(())
     }
     .await;
@@ -333,6 +368,9 @@ async fn execute(
     flash: &FirmwareFlash,
     p: &Payload,
     image: &[u8],
+    target: BulkRange,
+    controller_mode: u32,
+    allow_uncorrectable: bool,
     callbacks: &mut super::Callbacks<'_>,
 ) -> bulk::Result<Backup> {
     // Stock code is read through its uncached view before publishing any callback.
@@ -386,6 +424,8 @@ async fn execute(
     let mut allocation = None;
     let mut uploaded = false;
     let mut base = 0;
+    let minimum = flash.control.size.max(0x10000).next_power_of_two();
+    let mut capacity = target.size.max(minimum).min(CAPACITY).next_power_of_two();
     let outcome = async {
         touched = true;
         write(reader, bootstrap, &stub).await?;
@@ -394,17 +434,28 @@ async fn execute(
             reader.access.raw(bootstrap | bulk.code_alias, 32).await? == stub,
             "Bootstrap uncached readback differs",
         )?;
-        let reply = query
-            .invoke(reader, bootstrap as u32, ALLOCATION, [0, p.allocate], false)
-            .await?;
-        let raw = word(&reply[..4]);
+        let raw = loop {
+            let bytes = (capacity + BUFFER + 32) as u32;
+            let reply = query
+                .invoke(reader, bootstrap as u32, bytes, [0, p.allocate], false)
+                .await?;
+            let raw = word(&reply[..4]);
+            // A confirmed NULL is allocation failure, not uncertain completion.
+            // Try the next smaller owned buffer without changing read semantics.
+            if raw == 0 && capacity > minimum {
+                capacity /= 2;
+            } else {
+                break raw;
+            }
+        };
+        let allocation_bytes = capacity + BUFFER + 32;
         require(
             raw != 0
                 && raw.is_multiple_of(8)
                 && raw < bulk.code_alias
                 && bulk.window.contains(BulkRange {
                     address: raw | bulk.code_alias,
-                    size: u64::from(ALLOCATION),
+                    size: allocation_bytes,
                 }),
             "Stock allocation is outside DRAM; retained",
         )?;
@@ -424,7 +475,7 @@ async fn execute(
         .chain(p.checks.iter().map(|c| (c.address, c.size)))
         {
             require(
-                !(raw < at + n && at < raw + u64::from(ALLOCATION)),
+                !(raw < at + n && at < raw + allocation_bytes),
                 "Stock allocation overlaps protected state; retained",
             )?;
         }
@@ -448,50 +499,87 @@ async fn execute(
                 == code,
             "Reader DMA readback differs",
         )?;
-        let mut calls = 0;
-        let control = read(
-            reader,
-            query,
-            bulk,
-            flash,
-            base,
-            BulkRange {
-                address: flash.control.offset,
-                size: flash.control.size,
-            },
-            &mut calls,
-        )
-        .await?;
-        require(
-            bulk::hex(&sha256_bytes(&control)) == p.control_sha256,
-            "Control chunk differs from update; no backup read",
-        )?;
-        let mut digest = super::xp5::OrderedDigest::default();
-        let mut done = 0;
-        for (offset, size) in super::xp5::pieces(flash.window.size, CAPACITY, p.update_size) {
-            let bytes = read(
+        let lease = &mut CallbackLease::new(query.callback, u64::from(query.stock), base, 4);
+        let capture = async {
+            lease.publish(reader).await?;
+            let mut calls = 0;
+            let mut uncorrectable_page_offsets = Vec::new();
+            let mut nand_read_stats = super::NandReadStats {
+                buffer_bytes: capacity,
+                ..Default::default()
+            };
+            let control = read_chunk(
                 reader,
-                query,
                 bulk,
                 flash,
                 base,
                 BulkRange {
-                    address: offset,
-                    size,
+                    address: flash.control.offset,
+                    size: flash.control.size,
                 },
                 &mut calls,
+                &mut uncorrectable_page_offsets,
+                &mut nand_read_stats,
+                base + u64::from(p.observer_offset - p.reader_offset),
+                lease,
+                0,
             )
             .await?;
-            digest.push(offset, &bytes);
-            (callbacks.chunk)(offset, bytes).map_err(BulkError::Check)?;
-            done += size;
-            (callbacks.progress)(done, flash.window.size).map_err(BulkError::Check)?;
+            require(
+                uncorrectable_page_offsets.is_empty(),
+                "Control chunk has uncorrectable NAND pages",
+            )?;
+            require(
+                bulk::hex(&sha256_bytes(&control)) == p.control_sha256,
+                "Control chunk differs from update; no backup read",
+            )?;
+            let mut digest = super::xp5::OrderedDigest::default();
+            let mut done = 0;
+            for (offset, size) in
+                super::read_pieces(target, capacity, p.update_size, flash.window.size)
+            {
+                let bytes = read_chunk(
+                    reader,
+                    bulk,
+                    flash,
+                    base,
+                    BulkRange {
+                        address: offset,
+                        size,
+                    },
+                    &mut calls,
+                    &mut uncorrectable_page_offsets,
+                    &mut nand_read_stats,
+                    base + u64::from(p.observer_offset - p.reader_offset),
+                    lease,
+                    controller_mode,
+                )
+                .await?;
+                require(
+                    uncorrectable_page_offsets.is_empty() || allow_uncorrectable,
+                    "Requested flash range has uncorrectable NAND pages",
+                )?;
+                digest.push(offset - target.address, &bytes);
+                (callbacks.chunk)(offset, bytes).map_err(BulkError::Check)?;
+                done += size;
+                (callbacks.progress)(done, target.size).map_err(BulkError::Check)?;
+            }
+            Ok(Backup {
+                device: flash.device.clone(),
+                size: target.size,
+                sha256: digest.finish(target.size)?,
+                uncorrectable_page_offsets,
+                nand_read_stats: Some(nand_read_stats),
+                uncorrectable_granularity_bytes: flash
+                    .reader
+                    .nand
+                    .as_ref()
+                    .map_or(0, |n| n.page_bytes * n.max_pages_per_call),
+            })
         }
-        Ok(Backup {
-            device: flash.device.clone(),
-            size: flash.window.size,
-            sha256: digest.finish(flash.window.size)?,
-        })
+        .await;
+        let restored = lease.restore(reader).await;
+        bulk::finish(capture, restored)
     }
     .await;
     let cleanup = async {
@@ -554,14 +642,18 @@ async fn execute(
     bulk::finish(outcome, cleanup)
 }
 
-async fn read(
+async fn read_chunk(
     reader: &mut Qualified<'_>,
-    query: &Query,
     bulk: &FirmwareBulk,
     flash: &FirmwareFlash,
     base: u64,
     target: BulkRange,
     calls: &mut u32,
+    uncorrectable_page_offsets: &mut Vec<u64>,
+    stats: &mut super::NandReadStats,
+    observer: u64,
+    lease: &CallbackLease,
+    controller_mode: u32,
 ) -> bulk::Result<Vec<u8>> {
     let (offset, size) = (target.address, target.size);
     let nand = flash.reader.nand.as_ref().expect("validated NAND ABI");
@@ -574,7 +666,7 @@ async fn read(
     let request = (base + REQUEST) | bulk.code_alias;
     let buffer = (base + BUFFER) | bulk.code_alias;
     let values = [
-        1,
+        6,
         offset as u32,
         size as u32,
         buffer as u32,
@@ -589,19 +681,49 @@ async fn read(
         0,
         0,
         0,
+        observer as u32,
+        nand.max_pages_per_call,
+        controller_mode,
+        flash
+            .code_ranges
+            .iter()
+            .find(|r| r.name == "NAND correction mode")
+            .ok_or_else(|| BulkError::Check("NAND correction restoration entry is missing".into()))?
+            .address as u32,
     ];
-    write(reader, request, &words(&values)).await?;
-    query
-        .invoke(reader, base as u32, request as u32, [0, 0], false)
+    if *calls == 0 {
+        write(reader, request, &words(&values)).await?;
+    } else {
+        // Only source/length change during a capture; result echoes and the
+        // monotonic call counter verify this write without a separate readback.
+        reader
+            .access
+            .write(request + 4, &words(&values[1..3]))
+            .await?;
+        if *calls == 1 && controller_mode != 0 {
+            write(reader, request + 68, &controller_mode.to_le_bytes()).await?;
+        }
+    }
+    lease.check(reader).await?;
+    let reply = reader
+        .access
+        .session
+        .diagnostic_query(DiagnosticTag::Research(request as u32))
         .await?;
-    let result = reader.access.raw(request + 40, 20).await?;
+    require(
+        reply.status == CommandStatus::Success,
+        "NAND query execution refused",
+    )?;
+    let bitmap_bytes = (size / u64::from(nand.page_bytes)).div_ceil(32) * 4;
+    let result = reader.access.raw(request + 40, 52 + bitmap_bytes).await?;
     *calls = calls
         .checked_add(1)
         .ok_or(BulkError::Check("Reader count overflow".into()))?;
     require(
         word(&result[4..8]) == u64::from(*calls)
             && word(&result[8..12]) == offset
-            && word(&result[12..16]) == size,
+            && word(&result[12..16]) == size
+            && word(&result[28..32]) == u64::from(controller_mode),
         "NAND result does not describe this request",
     )?;
     require(
@@ -612,12 +734,49 @@ async fn read(
             word(&result[16..20])
         ),
     )?;
+    stats.stock_calls += word(&result[36..40]);
+    stats.burst_calls += word(&result[40..44]);
+    stats.fallback_pages += word(&result[44..48]);
+    stats.uncorrectable_burst_pages += word(&result[48..52]);
+    uncorrectable_page_offsets.extend(decode_uncorrectable(
+        &result[52..],
+        offset,
+        size,
+        nand.page_bytes,
+    )?);
     reader
         .read(BulkRange {
             address: buffer,
             size,
         })
         .await
+}
+
+fn decode_uncorrectable(
+    bitmap: &[u8],
+    offset: u64,
+    size: u64,
+    page_bytes: u32,
+) -> bulk::Result<Vec<u64>> {
+    let pages = size / u64::from(page_bytes);
+    require(
+        pages > 0
+            && pages <= CAPACITY / u64::from(page_bytes)
+            && bitmap.len() as u64 == pages.div_ceil(32) * 4,
+        "NAND ECC bitmap exceeds request",
+    )?;
+    let words: Vec<u32> = bitmap
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    require(
+        pages.is_multiple_of(32) || words.last().unwrap() >> (pages % 32) == 0,
+        "NAND ECC bitmap exceeds request",
+    )?;
+    Ok((0..pages)
+        .filter(|index| words[*index as usize / 32] & (1u32 << (index % 32)) != 0)
+        .map(|index| offset + index * u64::from(page_bytes))
+        .collect())
 }
 
 #[cfg(test)]

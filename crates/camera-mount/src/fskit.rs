@@ -1,12 +1,28 @@
 //! FSKit adapter through the version-pinned FSKitBridge protocol. Storage,
 //! addressing, namespace, bounds and USB ownership remain in Rust.
-use crate::{CameraFs, Device, IO_BYTES, MEMORY, Node, ROOT};
+use crate::{CameraFs, Device, IO_BYTES, MEMORY, MEMORY_IO_BYTES, Node, ROOT};
 use async_trait::async_trait;
 use fskit_rs::*;
 use std::{
     ffi::OsStr,
     sync::{Arc, Mutex},
 };
+
+/// FSKitBridge's raw resource must have a nonzero extent before attachment.
+/// The bridge crate otherwise creates an empty file on a fresh installation.
+pub fn prepare_bridge_resource() -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open("/tmp/fskitbridge.dmg")
+    {
+        Ok(file) => file.set_len(1 << 20),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 pub struct Adapter<D> {
     fs: Arc<Mutex<CameraFs<D>>>,
@@ -25,6 +41,9 @@ impl<D> Clone for Adapter<D> {
 }
 
 impl<D: Device + 'static> Adapter<D> {
+    pub async fn shutdown(&self) -> Result<()> {
+        self.work(|fs| fs.shutdown()).await
+    }
     pub fn new(fs: CameraFs<D>, uid: u32, gid: u32) -> Self {
         Self {
             fs: Arc::new(Mutex::new(fs)),
@@ -311,13 +330,18 @@ impl<D: Device + 'static> Filesystem for Adapter<D> {
     async fn read(&mut self, id: u64, offset: i64, length: i64) -> Result<Vec<u8>> {
         let offset = u64::try_from(offset).map_err(|_| Error::Posix(libc::EINVAL))?;
         let length = usize::try_from(length).map_err(|_| Error::Posix(libc::EINVAL))?;
-        if length > 16 * 1024 * 1024 {
+        if length > MEMORY_IO_BYTES {
             return Err(Error::Posix(libc::EINVAL));
         }
         self.work(move |fs| {
             let mut data = Vec::with_capacity(length);
             while data.len() < length {
-                let n = IO_BYTES.min(length - data.len());
+                let limit = if id == MEMORY {
+                    MEMORY_IO_BYTES
+                } else {
+                    IO_BYTES
+                };
+                let n = limit.min(length - data.len());
                 let part = fs.read(
                     id,
                     offset.checked_add(data.len() as u64).ok_or(libc::EINVAL)?,

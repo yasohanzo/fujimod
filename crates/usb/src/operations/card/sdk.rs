@@ -73,6 +73,17 @@ impl Sdk<'_, '_> {
     }
 
     async fn read_buffer(&mut self, address: u32, size: u32) -> Result<Vec<u8>> {
+        // Borrowing E1's publication pair costs eight control exchanges. A
+        // small CPU read is cheaper and also avoids padding a tiny transfer.
+        let cpu = self
+            .host
+            .limits
+            .read
+            .get()
+            .min(self.host.session.info().advertised_packet_bytes.get());
+        if size <= cpu.saturating_mul(8) {
+            return self.host.read(address, size).await;
+        }
         let Some(source) = self.p.bulk_source else {
             return self.host.read(address, size).await;
         };
@@ -103,6 +114,22 @@ impl Sdk<'_, '_> {
         )?;
         raw.truncate(size as usize);
         Ok(raw)
+    }
+
+    async fn write_buffer(&mut self, address: u32, raw: &[u8]) -> Result<()> {
+        if self
+            .host
+            .io
+            .as_ref()
+            .is_some_and(|io| io.admits_write(address, raw.len() as u32, self.p.chunk_bytes))
+        {
+            // Discard dirty cached aliases before DMA. Afterward no CPU access
+            // touches the payload until the existing post-transfer sync.
+            self.call(self.p.cache, &[]).await?;
+        }
+        self.host
+            .write_owned(address, raw, self.p.chunk_bytes)
+            .await
     }
 
     async fn allocate(&mut self) -> Result<()> {
@@ -392,7 +419,7 @@ impl Sdk<'_, '_> {
                 self.seek(offset).await?;
                 for raw in data.chunks(self.p.chunk_bytes as usize) {
                     let buffer = self.buffer()?;
-                    self.host.write(buffer, raw).await?;
+                    self.write_buffer(buffer, raw).await?;
                     self.call(self.p.cache, &[]).await?;
                     let (status, n) = self
                         .io(
@@ -462,7 +489,7 @@ impl Sdk<'_, '_> {
                 self.open(&path, 1).await?;
                 for raw in data.chunks(self.p.chunk_bytes as usize) {
                     let buffer = self.buffer()?;
-                    self.host.write(buffer, raw).await?;
+                    self.write_buffer(buffer, raw).await?;
                     self.call(self.p.cache, &[]).await?;
                     let (status, n) = self
                         .io(
@@ -587,7 +614,10 @@ pub(super) async fn prepare<'a, 'p>(mut host: Host<'a>, p: &'p StockSdk) -> Resu
     if let Err(error) = sdk.allocate().await {
         return match sdk.cleanup().await {
             Ok(()) => Err(error),
-            Err(cleanup) => Err(fail(format!("{error}; cleanup: {cleanup}"))),
+            Err(cleanup) => {
+                sdk.host.session.invalidate_completion();
+                Err(fail(format!("{error}; cleanup: {cleanup}")))
+            }
         };
     }
     Ok(sdk)

@@ -1,5 +1,5 @@
-//! A mount owns its reservation until explicit close. Preparation is amortized
-//! across requests; the same exclusive session also serves read-only memory.
+//! A bounded file transaction owns its reservation until explicit close.
+//! Close before releasing its ff80 session to another client.
 use super::*;
 use crate::ff80::SessionState;
 
@@ -14,11 +14,21 @@ pub struct Volume<'a> {
 }
 
 impl<'a> Volume<'a> {
+    pub fn set_query_trigger(&mut self, trigger: QueryTrigger) -> Result<()> {
+        match &mut self.backend {
+            Backend::Mailbox(service) => {
+                service.trigger = Some(trigger);
+                Ok(())
+            }
+            Backend::Sdk(_) => Err(fail("Query trigger requires an owned file service")),
+        }
+    }
     pub async fn attach(
         session: &'a mut Session,
         limits: DebugMemoryLimits,
         capability: &'a FirmwareCard,
-        reader: Option<&'a mut dyn RangeRead>,
+        io: Option<&'a mut dyn BufferIo>,
+        mailbox_hint: Option<u32>,
     ) -> Result<Self> {
         capability.validate().map_err(fail)?;
         require(
@@ -35,26 +45,32 @@ impl<'a> Volume<'a> {
                     == capability.internal_version,
             "Card capability identifies another firmware",
         )?;
-        let mut host = Host {
-            session,
-            limits,
-            reader,
-        };
-        for check in &capability.code_checks {
-            let bytes = host
-                .read(
+        let checks = capability
+            .code_checks
+            .iter()
+            .map(|check| {
+                super::super::checks::Sha256Check::from_hex(
                     check
                         .address
                         .try_into()
                         .map_err(|_| Error::AddressOverflow)?,
                     check.size.try_into().map_err(|_| Error::InvalidLength)?,
+                    &check.sha256,
                 )
-                .await?;
-            require(
-                format!("{:x}", Sha256::digest(bytes)) == check.sha256,
-                "Stock card instructions differ",
-            )?;
-        }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut host = Host {
+            session,
+            limits,
+            io,
+        };
+        super::super::checks::verify_sha256(
+            host.session,
+            host.limits,
+            &checks,
+            host.io.as_mut().map(|io| &mut **io as &mut dyn BufferIo),
+        )
+        .await?;
         let backend = match &capability.mechanism {
             Mechanism::StockSdk(p) => Backend::Sdk(sdk::prepare(host, p).await?),
             Mechanism::Mailbox {
@@ -63,14 +79,30 @@ impl<'a> Volume<'a> {
                 address_alias,
                 build,
             } => Backend::Mailbox(
-                mailbox::prepare(host, *search_address, *search_bytes, *address_alias, *build)
-                    .await?,
+                mailbox::prepare(
+                    host,
+                    *search_address,
+                    *search_bytes,
+                    *address_alias,
+                    *build,
+                    mailbox_hint,
+                )
+                .await?,
             ),
         };
         Ok(Self {
             backend,
             usable: true,
         })
+    }
+
+    /// A discovery hint only; the descriptor and all pointers are revalidated
+    /// in the next transaction. No camera reservation survives close.
+    pub fn mailbox_address(&self) -> Option<u32> {
+        match &self.backend {
+            Backend::Sdk(_) => None,
+            Backend::Mailbox(s) => Some(s.location()),
+        }
     }
 
     fn host(&mut self) -> &mut Host<'a> {
@@ -119,7 +151,8 @@ impl<'a> Volume<'a> {
         result
     }
 
-    /// Caller validates readable regions. This never uses writes or E1 setup.
+    /// Caller validates readable regions. Only read access is exposed; an
+    /// accelerator may borrow and restore its transport publication state.
     pub async fn read_memory(&mut self, address: u32, size: u32) -> Result<Vec<u8>> {
         require(
             self.usable,

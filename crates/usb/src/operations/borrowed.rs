@@ -29,14 +29,15 @@ const RESTORE: usize = 4;
 /// rejected status therefore does not stop later calls in the same batch: batch
 /// only calls that are safe to run whatever an earlier call returned. After
 /// every query the USB owner checks that the slot still holds the borrowed
-/// callback; another writer's value stops the batch and is never overwritten.
+/// callback (or the exact stock value for an explicitly self-restoring call);
+/// another writer's value stops the batch and is never overwritten.
 #[derive(Clone)]
 pub struct BorrowedQueries {
     callback: Address,
     stock: Address,
     output: MemoryRange,
     original: Vec<u8>,
-    calls: Vec<(Address, DiagnosticTag, Vec<(u32, u32)>, Vec<u8>)>,
+    calls: Vec<(Address, DiagnosticTag, Vec<(u32, u32)>, Vec<u8>, bool)>,
 }
 impl BorrowedQueries {
     pub fn new(
@@ -94,9 +95,26 @@ impl BorrowedQueries {
             });
         }
         let first = GUARDS + PER_CALL * self.calls.len();
-        self.calls.push((callback, tag, statuses, output));
+        self.calls.push((callback, tag, statuses, output, false));
         Ok((first + 2, first + 4))
     }
+    /// Append a qualified callback that restores its own slot before returning.
+    /// The caller must independently qualify that firmware ordering. After the
+    /// query, the sequence requires the exact stock value; an unexpected value
+    /// stops the batch before any restoration writes. This is not permission
+    /// to treat a disconnected query as complete or to retry it.
+    pub fn call_restoring_slot(
+        &mut self,
+        callback: Address,
+        tag: DiagnosticTag,
+        statuses: Vec<(u32, u32)>,
+        output: Vec<u8>,
+    ) -> Result<(usize, usize)> {
+        let indices = self.call(callback, tag, statuses, output)?;
+        self.calls.last_mut().expect("appended call").4 = true;
+        Ok(indices)
+    }
+
     /// Run the batch as one checked sequence. Return the raw query reply and
     /// captured output for each call. A call whose device status is not one it
     /// accepts fails after the batch has restored and verified both words.
@@ -111,7 +129,7 @@ impl BorrowedQueries {
         }
         let replies = session.sequence(commands, limits).await?;
         let mut results = Vec::with_capacity(self.calls.len());
-        for (index, (_, _, statuses, _)) in self.calls.iter().enumerate() {
+        for (index, (_, _, statuses, _, _)) in self.calls.iter().enumerate() {
             let first = GUARDS + PER_CALL * index;
             let reply = replies[first + 2].clone();
             let status = match DiagnosticReply::decode(reply.clone(), 0x450006)?.status {
@@ -135,7 +153,7 @@ impl BorrowedQueries {
             Self::read(self.callback, 4, Some(stock.clone())),
             Self::read(self.output.address(), length, Some(self.original.clone())),
         ];
-        for (callback, tag, _, output) in &self.calls {
+        for (callback, tag, _, output, restores_slot) in &self.calls {
             commands.extend([
                 SequenceCommand::Write {
                     address: self.output.address(),
@@ -149,7 +167,15 @@ impl BorrowedQueries {
                     tag: *tag,
                     statuses: None,
                 },
-                Self::read(self.callback, 4, Some(callback.0.to_le_bytes().to_vec())),
+                Self::read(
+                    self.callback,
+                    4,
+                    Some(if *restores_slot {
+                        stock.clone()
+                    } else {
+                        callback.0.to_le_bytes().to_vec()
+                    }),
+                ),
                 Self::read(self.output.address(), length, None),
             ]);
         }
@@ -228,6 +254,9 @@ mod tests {
     }
     /// The complete exchange for one call that replies with `status`.
     fn script(status: (u32, u32)) -> Script {
+        script_with_slot(status, 0x8000)
+    }
+    fn script_with_slot(status: (u32, u32), after_slot: u32) -> Script {
         let mut s = vec![
             E::Control(envelope(RequestKind::Open, 8, 0)),
             E::Read {
@@ -241,7 +270,7 @@ mod tests {
         write(&mut s, 0x1000, &0x8000u32.to_le_bytes());
         let request = crate::ff80::commands::diagnostic::query(DiagnosticTag::Research(7));
         command(&mut s, request, query_reply(7, status));
-        read(&mut s, 0x1000, &0x8000u32.to_le_bytes());
+        read(&mut s, 0x1000, &after_slot.to_le_bytes());
         read(&mut s, 0x1100, b"captured");
         write(&mut s, 0x1000, &0x9000u32.to_le_bytes());
         write(&mut s, 0x1100, b"original");
@@ -373,5 +402,48 @@ mod tests {
         assert!(block_on(plan().invoke(&mut session, limits())).is_err());
         assert_eq!(script.remaining(), 0);
         assert_eq!(session.state(), SessionState::Ready);
+    }
+    fn restoring_plan() -> BorrowedQueries {
+        let mut p = BorrowedQueries::new(
+            Address(0x1000),
+            Address(0x9000),
+            Address(0x1100),
+            b"original".to_vec(),
+        )
+        .unwrap();
+        p.call_restoring_slot(
+            Address(0x8000),
+            DiagnosticTag::Research(7),
+            vec![(0, 0)],
+            vec![0; 8],
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn self_restored_slot_is_checked_before_output_cleanup() {
+        let script = script_with_slot((0, 0), 0x9000);
+        let mut session = block_on(script.begin_session(256, None)).unwrap();
+        let results = block_on(restoring_plan().invoke(&mut session, limits())).unwrap();
+        assert_eq!(
+            results,
+            vec![(query_reply(7, (0, 0)), b"captured".to_vec())]
+        );
+        assert_eq!(script.remaining(), 0);
+        assert_eq!(session.state(), SessionState::Ready);
+    }
+
+    #[test]
+    fn self_restoring_call_refuses_borrowed_or_foreign_slot_before_writes() {
+        for after_slot in [0x8000, 0xdeadbeef] {
+            let script = script_with_slot((0, 0), after_slot);
+            let mut session = block_on(script.begin_session(256, None)).unwrap();
+            assert!(block_on(restoring_plan().invoke(&mut session, limits())).is_err());
+            // Five commands remain: capture output, restore slot/output, and
+            // verify both. Each command consumes four transport exchanges.
+            assert_eq!(script.remaining(), 20);
+            assert_eq!(session.state(), SessionState::CompletionUnknown);
+        }
     }
 }

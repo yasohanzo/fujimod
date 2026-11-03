@@ -6,6 +6,16 @@ fn instruction_rate() -> (u64, u64) {
     (1, 1)
 }
 
+/// CPU-interface registers inherited at an explicitly selected entry boundary.
+/// Distributor, pending and active interrupt state retain their cold values.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialGicCpuInterface {
+    pub enabled: bool,
+    pub priority_mask: u8,
+    pub binary_point: u8,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Definition {
@@ -16,6 +26,9 @@ pub struct Definition {
     pub memory_regions: Vec<super::memory::Region>,
     #[serde(default)]
     pub initial_registers: Vec<Vec<(Register, u64)>>,
+    /// Empty means cold state; otherwise exactly one declared state per core.
+    #[serde(default)]
+    pub initial_gic_cpu_interfaces: Vec<InitialGicCpuInterface>,
     #[serde(default)]
     pub labels: Vec<u32>,
     #[serde(default)]

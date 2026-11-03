@@ -4,7 +4,7 @@ mod abort;
 mod client;
 mod definition;
 pub mod memory;
-pub use definition::Definition;
+pub use definition::{Definition, InitialGicCpuInterface};
 pub mod observation;
 use observation::Call;
 mod devices;
@@ -947,6 +947,7 @@ impl Session {
             discovery,
             memory_regions,
             initial_registers,
+            initial_gic_cpu_interfaces,
             labels,
             cbar,
             timer_base,
@@ -1058,6 +1059,30 @@ impl Session {
                 .any(|&(_, irq)| !(32..512).contains(&irq))
         {
             return Err("Invalid ARMv7-A peripheral reset inputs".to_owned());
+        }
+        let mut gic = Gic::new(cores, 512);
+        if !initial_gic_cpu_interfaces.is_empty() {
+            if cbar.is_none() {
+                return Err("Initial GIC CPU interfaces require an explicit CBAR".to_owned());
+            }
+            if initial_gic_cpu_interfaces.len() != cores
+                || initial_gic_cpu_interfaces
+                    .iter()
+                    .any(|state| state.binary_point > 7)
+            {
+                return Err(
+                    "Initial GIC CPU interfaces require one valid state per core".to_owned(),
+                );
+            }
+            for (core, state) in initial_gic_cpu_interfaces.iter().enumerate() {
+                for (offset, value) in [
+                    (0, u32::from(state.enabled)),
+                    (4, u32::from(state.priority_mask)),
+                    (8, u32::from(state.binary_point)),
+                ] {
+                    gic.access(core, false, offset, 4, true, value)?;
+                }
+            }
         }
         let ram = Backing::zeros(ram_size);
         let memory = memory::allocate(memory_regions, ram_size)?;
@@ -1574,7 +1599,7 @@ impl Session {
                 redirected: None,
                 pages: BTreeMap::new(),
                 cbar_reads: 0,
-                gic: Gic::new(cores, 512),
+                gic,
                 timer,
                 irq_entries: vec![0; cores],
                 undefined_entries: vec![0; cores],

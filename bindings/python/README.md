@@ -26,6 +26,16 @@ The native extension also exposes `fujimod.emulator`. For a resolved graph, buil
 pass the matching bytes to `make_board`. Declared images are loaded into mapped
 memory before execution.
 
+`Xp4Definition.options` can declare `initial_gic_cpu_interfaces` when an
+ARMv7-A entry inherits configured CPU interfaces. Supply one object per core,
+each with `enabled` (boolean), `priority_mask` (0–255) and `binary_point`
+(0–7), together with an explicit `cbar`. An omitted or empty list retains
+cold interface state. This input changes only those CPU-interface registers;
+it does not enable the distributor or create pending or active interrupts.
+The selected values describe the caller's entry state, not controller reset
+defaults. Guest software continues to configure and acknowledge interrupts
+through the normal register model.
+
 For a catalog runtime, `Board.from_inputs` takes explicit paths to the update
 file, real boot ROM and selected Unicorn library. Optional NAND and settings
 files are separate keyword arguments. Body and firmware identifiers select

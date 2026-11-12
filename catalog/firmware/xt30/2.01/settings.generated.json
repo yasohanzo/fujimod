@@ -26,6 +26,18 @@
     },
     "loader_offset": 328,
     "records": {
+      "format": {
+        "block": 1016,
+        "bytes": 16,
+        "defaults": {
+          "address": 21652056,
+          "size": 8,
+          "sha256": "ec243aa91cf1dcd155864e695f721f7dd309c6edbd142b36a340718d5c4f5f72"
+        },
+        "defaults_offset": 0,
+        "parity_offset": 8,
+        "fields": []
+      },
       "main": {
         "block": 1018,
         "bytes": 32768,
@@ -44,6 +56,13 @@
               255
             ],
             "basis": "Erased bytes after the journal sequence word."
+          },
+          {
+            "offset": 620,
+            "bytes": [
+              4
+            ],
+            "basis": "Stock migration 0x00ff3c6c clears the date flag below version 4."
           },
           {
             "offset": 31736,
@@ -1196,6 +1215,15 @@
       "offset": 710,
       "values": {
         "en": [
+          1
+        ]
+      }
+    },
+    "app-introduction": {
+      "store": "main",
+      "offset": 3756,
+      "values": {
+        "done": [
           1
         ]
       }
